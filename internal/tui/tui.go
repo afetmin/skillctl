@@ -94,14 +94,15 @@ type uiModel struct {
 	pending      map[string]pendingChange
 	applied      map[string]bool
 
-	search       textinput.Model
-	searching    bool
-	help         bool
-	detail       bool
-	detailOffset int
-	confirm      bool
-	applying     bool
-	loading      bool
+	search        textinput.Model
+	searching     bool
+	help          bool
+	detail        bool
+	detailOffset  int
+	confirm       bool
+	confirmOffset int
+	applying      bool
+	loading       bool
 
 	spinner     spinner.Model
 	status      string
@@ -179,6 +180,7 @@ func (m uiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 		m.ensureVisible()
+		m.confirmOffset = clamp(m.confirmOffset, 0, m.confirmMaxOffset())
 		return m, nil
 	case spinner.TickMsg:
 		m.spinner, _ = m.spinner.Update(msg)
@@ -197,6 +199,7 @@ func (m uiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		m.applying = false
 		m.loading = true
 		m.confirm = false
+		m.confirmOffset = 0
 		if msg.err != nil {
 			m.status = msg.err.Error()
 			for id, change := range m.pending {
@@ -283,6 +286,7 @@ func (m uiModel) updateMain(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "a":
 		if len(m.pending) > 0 && !m.applying {
 			m.confirm = true
+			m.confirmOffset = 0
 		}
 		return m, nil
 	case "u":
@@ -406,9 +410,40 @@ func (m uiModel) updateConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, m.applyCmd()
 	case "n", "esc", "q":
 		m.confirm = false
+		m.confirmOffset = 0
+		return m, nil
+	case "up", "k":
+		m.moveConfirm(-1)
+		return m, nil
+	case "down", "j":
+		m.moveConfirm(1)
+		return m, nil
+	case "pgup":
+		m.moveConfirm(-m.confirmVisibleCount())
+		return m, nil
+	case "pgdown":
+		m.moveConfirm(m.confirmVisibleCount())
+		return m, nil
+	case "home":
+		m.confirmOffset = 0
+		return m, nil
+	case "end":
+		m.confirmOffset = m.confirmMaxOffset()
 		return m, nil
 	}
 	return m, nil
+}
+
+func (m *uiModel) moveConfirm(delta int) {
+	m.confirmOffset = clamp(m.confirmOffset+delta, 0, m.confirmMaxOffset())
+}
+
+func (m uiModel) confirmVisibleCount() int {
+	return max(1, m.height-4)
+}
+
+func (m uiModel) confirmMaxOffset() int {
+	return max(0, len(m.pending)-m.confirmVisibleCount())
 }
 
 func (m uiModel) updateDetail(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -436,6 +471,12 @@ func (m uiModel) handleMouse(event tea.MouseEvent) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	if m.confirm {
+		switch event.Button {
+		case tea.MouseButtonWheelUp:
+			m.moveConfirm(-3)
+		case tea.MouseButtonWheelDown:
+			m.moveConfirm(3)
+		}
 		return m, nil
 	}
 	if m.detail {

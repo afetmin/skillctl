@@ -261,7 +261,7 @@ func (m uiModel) helpView() string {
 		headingStyle.Render("Windows"),
 		helpLine("Detail", "j/k scroll, o editor, Esc/Enter back", contentWidth),
 		helpLine("Search", "Enter accept, Esc clear", contentWidth),
-		helpLine("Confirm", "Enter/y apply, Esc/n cancel", contentWidth),
+		helpLine("Confirm", "j/k or PgUp/PgDn scroll, Enter/y apply", contentWidth),
 		mutedStyle.Render("h / Esc / q / Enter  close help"),
 	}
 	maxLines := max(3, m.height-4)
@@ -279,7 +279,11 @@ func helpLine(key, description string, width int) string {
 
 func (m uiModel) confirmView() string {
 	lines := []string{titleStyle.Render("Apply pending changes?"), ""}
-	for _, id := range m.pendingIDs() {
+	ids := m.pendingIDs()
+	visible := m.confirmVisibleCount()
+	start := clamp(m.confirmOffset, 0, max(0, len(ids)-visible))
+	end := min(len(ids), start+visible)
+	for _, id := range ids[start:end] {
 		change := m.pending[id]
 		line := fmt.Sprintf("  %s: %s -> %s", id, change.BaseActual, change.Desired)
 		if change.Conflict {
@@ -287,7 +291,12 @@ func (m uiModel) confirmView() string {
 		}
 		lines = append(lines, fitLine(line, m.width))
 	}
-	lines = append(lines, "", warnStyle.Render("Enter/y apply")+"  Esc/n cancel")
+	for len(lines) < visible+2 {
+		lines = append(lines, "")
+	}
+	position := fmt.Sprintf("%d-%d of %d", start+1, end, len(ids))
+	hints := mutedStyle.Render("↑/↓ j/k PgUp/PgDn Home/End scroll") + "  " + warnStyle.Render("Enter/y apply") + "  Esc/n cancel"
+	lines = append(lines, mutedStyle.Render(position), hints)
 	return fitScreen(lines, m.width, m.height)
 }
 
