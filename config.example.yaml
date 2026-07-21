@@ -1,0 +1,11 @@
+version: 1
+active_profile: default
+defaults:
+  invocation: manual
+profiles:
+  default:
+    implicit: []
+    disabled: []
+adapters:
+  codex:
+    command: codex
