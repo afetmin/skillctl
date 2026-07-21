@@ -442,6 +442,15 @@ func (m Manager) discover(ctx context.Context, cfg config.Config) ([]model.Skill
 }
 
 func mergeSkills(primary, secondary []model.Skill) []model.Skill {
+	primaryPaths := make(map[string]bool, len(primary))
+	for _, skill := range primary {
+		primaryPaths[skill.Path] = true
+	}
+	for index := range secondary {
+		if secondary[index].Scope == model.ScopePlugin && !primaryPaths[secondary[index].Path] {
+			secondary[index].Enabled = false
+		}
+	}
 	sort.SliceStable(secondary, func(i, j int) bool {
 		return skillModTime(secondary[i]).After(skillModTime(secondary[j]))
 	})
