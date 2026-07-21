@@ -14,13 +14,16 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/charmbracelet/x/term"
 	"github.com/spf13/cobra"
 
 	"skillctl/internal/config"
+	"skillctl/internal/inventory"
 	"skillctl/internal/launchagent"
 	"skillctl/internal/model"
 	"skillctl/internal/service"
 	statestore "skillctl/internal/state"
+	"skillctl/internal/tui"
 	"skillctl/internal/watcher"
 )
 
@@ -80,16 +83,21 @@ func newRoot() (*cobra.Command, error) {
 		Short:         "Control which agent skills enter the model context",
 		SilenceErrors: true,
 		SilenceUsage:  true,
+		Args:          noArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runTUI(cmd.Context(), values, false)
+		},
 	}
 	root.SetFlagErrorFunc(func(command *cobra.Command, err error) error {
 		return &ExitError{Code: 2, Err: err}
 	})
 	root.PersistentFlags().StringVar(&values.configPath, "config", values.configPath, "configuration file")
-	root.PersistentFlags().StringVar(&values.statePath, "state", values.statePath, "local state file")
+	root.PersistentFlags().StringVar(&values.statePath, "state-file", values.statePath, "local state file")
 	root.PersistentFlags().StringVarP(&values.cwd, "cwd", "C", values.cwd, "working directory used for skill discovery")
 	root.PersistentFlags().BoolVar(&values.json, "json", false, "emit machine-readable JSON")
 
 	root.AddCommand(
+		newTUICommand(values),
 		newInitCommand(values),
 		newListCommand(values),
 		newStatusCommand(values),
@@ -115,6 +123,38 @@ func newRoot() (*cobra.Command, error) {
 		},
 	)
 	return root, nil
+}
+
+func newTUICommand(values *options) *cobra.Command {
+	var project bool
+	command := &cobra.Command{
+		Use:   "tui",
+		Short: "Open the interactive skill manager",
+		Args:  noArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runTUI(cmd.Context(), values, project)
+		},
+	}
+	command.Flags().BoolVar(&project, "project", false, "allow staging changes to project skills")
+	return command
+}
+
+func runTUI(ctx context.Context, values *options, project bool) error {
+	if values.json {
+		return &ExitError{Code: 2, Err: errors.New("tui does not support --json; use skillctl list --json")}
+	}
+	if !term.IsTerminal(os.Stdin.Fd()) || !term.IsTerminal(os.Stdout.Fd()) {
+		return &ExitError{Code: 2, Err: errors.New("interactive terminal required; use skillctl list or skillctl list --json")}
+	}
+	manager := values.manager()
+	if _, exists, err := config.LoadOrDefault(manager.ConfigPath); err != nil {
+		return err
+	} else if !exists {
+		if _, _, err := manager.Init(ctx, false, false); err != nil {
+			return err
+		}
+	}
+	return tui.Run(ctx, tui.Options{Manager: manager, Project: project})
 }
 
 func (o *options) manager() service.Manager {
@@ -153,6 +193,10 @@ func newInitCommand(values *options) *cobra.Command {
 
 func newListCommand(values *options) *cobra.Command {
 	var project bool
+	var state string
+	var scope string
+	var source string
+	var drift bool
 	command := &cobra.Command{
 		Use:     "list",
 		Aliases: []string{"ls"},
@@ -163,20 +207,24 @@ func newListCommand(values *options) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			filter, err := listFilter(state, scope, source, drift)
+			if err != nil {
+				return &ExitError{Code: 2, Err: err}
+			}
+			groups := inventory.GroupStatuses(inventory.Apply(items, filter))
 			if values.json {
-				return printJSON(map[string]any{"skills": items, "warnings": warnings})
+				return printJSON(map[string]any{"groups": groups, "warnings": warnings})
 			}
-			writer := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 4, 2, ' ', 0)
-			fmt.Fprintln(writer, "ACTUAL\tDESIRED\tSCOPE\tID")
-			for _, item := range items {
-				fmt.Fprintf(writer, "%s\t%s\t%s\t%s\n", item.Actual, item.Desired, item.Scope, item.ID)
-			}
-			writer.Flush()
+			printGroups(cmd, groups)
 			printWarnings(cmd, warnings)
 			return nil
 		},
 	}
 	command.Flags().BoolVar(&project, "project", false, "include project skills in management status")
+	command.Flags().StringVar(&state, "state", "", "filter by actual state: implicit, manual, or disabled")
+	command.Flags().BoolVar(&drift, "drift", false, "show only skills whose actual and desired states differ")
+	command.Flags().StringVar(&scope, "scope", "", "filter by scope: system, user, plugin, repo, admin, or other")
+	command.Flags().StringVar(&source, "source", "", "filter by source name")
 	return command
 }
 
@@ -386,7 +434,7 @@ func newWatchCommand(values *options) *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 			defer stop()
-			watch := watcher.Watcher{ConfigPath: values.configPath, Interval: interval}
+			watch := watcher.Watcher{ConfigPath: values.configPath, StatePath: values.statePath, CWD: values.cwd, Interval: interval}
 			return watch.Run(ctx, func(runContext context.Context) error {
 				report, err := values.manager().Sync(runContext, service.SyncOptions{})
 				if values.json {
@@ -539,6 +587,49 @@ func printWarnings(cmd *cobra.Command, warnings []string) {
 	for _, warning := range warnings {
 		fmt.Fprintf(cmd.ErrOrStderr(), "warning: %s\n", warning)
 	}
+}
+
+func printGroups(cmd *cobra.Command, groups []inventory.Group) {
+	if len(groups) == 0 {
+		fmt.Fprintln(cmd.OutOrStdout(), "No skills matched.")
+		return
+	}
+	for groupIndex, group := range groups {
+		if groupIndex > 0 {
+			fmt.Fprintln(cmd.OutOrStdout())
+		}
+		fmt.Fprintf(cmd.OutOrStdout(), "%s · %s\n", inventory.CategoryTitle(group.Category), group.Label)
+		fmt.Fprintln(cmd.OutOrStdout(), inventory.SummaryLine(group.Summary))
+		writer := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 4, 2, ' ', 0)
+		fmt.Fprintln(writer, "NAME\tACTUAL\tDESIRED\tMANAGED\tPATH")
+		for _, item := range group.Skills {
+			managed := "no"
+			if item.Managed {
+				managed = "yes"
+			}
+			fmt.Fprintf(writer, "%s\t%s\t%s\t%s\t%s\n", item.Name, item.Actual, item.Desired, managed, item.Path)
+		}
+		writer.Flush()
+	}
+}
+
+func listFilter(state, scope, source string, drift bool) (inventory.Filter, error) {
+	filter := inventory.Filter{Drift: drift, Source: source}
+	if state != "" {
+		filter.State = model.InvocationState(state)
+		if !filter.State.Valid() {
+			return inventory.Filter{}, fmt.Errorf("invalid state %q", state)
+		}
+	}
+	if scope != "" {
+		filter.Scope = model.Scope(scope)
+		switch filter.Scope {
+		case model.ScopeSystem, model.ScopeUser, model.ScopePlugin, model.ScopeRepo, model.ScopeAdmin, model.ScopeOther:
+		default:
+			return inventory.Filter{}, fmt.Errorf("invalid scope %q", scope)
+		}
+	}
+	return filter, nil
 }
 
 func printJSON(value any) error {

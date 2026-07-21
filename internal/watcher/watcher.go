@@ -15,6 +15,8 @@ import (
 
 type Watcher struct {
 	ConfigPath string
+	StatePath  string
+	CWD        string
 	Interval   time.Duration
 }
 
@@ -25,7 +27,7 @@ func (w Watcher) Run(ctx context.Context, sync func(context.Context) error) erro
 	if err := sync(ctx); err != nil {
 		return err
 	}
-	last, err := w.fingerprint()
+	last, err := w.Fingerprint()
 	if err != nil {
 		return err
 	}
@@ -36,7 +38,7 @@ func (w Watcher) Run(ctx context.Context, sync func(context.Context) error) erro
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
-			current, err := w.fingerprint()
+			current, err := w.Fingerprint()
 			if err != nil {
 				return err
 			}
@@ -46,7 +48,7 @@ func (w Watcher) Run(ctx context.Context, sync func(context.Context) error) erro
 			if err := sync(ctx); err != nil {
 				return err
 			}
-			last, err = w.fingerprint()
+			last, err = w.Fingerprint()
 			if err != nil {
 				return err
 			}
@@ -54,7 +56,7 @@ func (w Watcher) Run(ctx context.Context, sync func(context.Context) error) erro
 	}
 }
 
-func (w Watcher) fingerprint() (string, error) {
+func (w Watcher) Fingerprint() (string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", err
@@ -63,6 +65,9 @@ func (w Watcher) fingerprint() (string, error) {
 		filepath.Join(home, ".agents", "skills"),
 		filepath.Join(home, ".codex", "skills"),
 		filepath.Join(home, ".codex", "plugins", "cache"),
+	}
+	if w.CWD != "" {
+		roots = append(roots, filepath.Join(w.CWD, ".agents", "skills"))
 	}
 	var records []string
 	for _, root := range roots {
@@ -91,10 +96,16 @@ func (w Watcher) fingerprint() (string, error) {
 			return "", err
 		}
 	}
-	if info, err := os.Stat(w.ConfigPath); err == nil {
-		records = append(records, fmt.Sprintf("%s|%d|%d", w.ConfigPath, info.Size(), info.ModTime().UnixNano()))
-	} else if !os.IsNotExist(err) {
-		return "", err
+	files := []string{w.ConfigPath, w.StatePath, filepath.Join(home, ".codex", "config.toml")}
+	for _, path := range files {
+		if path == "" {
+			continue
+		}
+		if info, err := os.Stat(path); err == nil {
+			records = append(records, fmt.Sprintf("%s|%d|%d", path, info.Size(), info.ModTime().UnixNano()))
+		} else if !os.IsNotExist(err) {
+			return "", err
+		}
 	}
 	sort.Strings(records)
 	sum := sha256.Sum256([]byte(strings.Join(records, "\n")))

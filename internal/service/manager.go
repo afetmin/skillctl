@@ -34,6 +34,7 @@ type SkillStatus struct {
 	Actual  model.InvocationState `json:"actual"`
 	Desired model.InvocationState `json:"desired"`
 	Managed bool                  `json:"managed"`
+	Journal *statestore.Entry     `json:"-"`
 }
 
 type RestoreReport struct {
@@ -91,6 +92,10 @@ func (m Manager) List(ctx context.Context, project bool) ([]SkillStatus, []strin
 	if profileErr != nil {
 		return nil, warnings, profileErr
 	}
+	localState, err := statestore.LoadOrDefault(m.StatePath)
+	if err != nil {
+		return nil, warnings, err
+	}
 	var result []SkillStatus
 	for _, skill := range skills {
 		managed := skill.ManagedByDefault() || (project && skill.Scope == model.ScopeRepo)
@@ -99,12 +104,17 @@ func (m Manager) List(ctx context.Context, project bool) ([]SkillStatus, []strin
 		if managed {
 			desired = resolver.desired(cfg, skill)
 		}
-		result = append(result, SkillStatus{
+		status := SkillStatus{
 			Skill:   skill,
 			Actual:  actual,
 			Desired: desired,
 			Managed: managed,
-		})
+		}
+		if entry, ok := localState.Entries[skill.Path]; ok {
+			entryCopy := entry
+			status.Journal = &entryCopy
+		}
+		result = append(result, status)
 	}
 	return result, warnings, nil
 }
@@ -118,39 +128,64 @@ func (m Manager) Resolve(ctx context.Context, selector string) (model.Skill, err
 }
 
 func (m Manager) Set(ctx context.Context, selector string, desired model.InvocationState, noSync, project bool) (model.Skill, *model.SyncReport, error) {
-	if !desired.Valid() {
-		return model.Skill{}, nil, fmt.Errorf("invalid invocation state %q", desired)
+	skills, report, err := m.SetMany(ctx, map[string]model.InvocationState{selector: desired}, noSync, project)
+	if len(skills) == 0 {
+		return model.Skill{}, report, err
+	}
+	return skills[0], report, err
+}
+
+func (m Manager) SetMany(ctx context.Context, changes map[string]model.InvocationState, noSync, project bool) ([]model.Skill, *model.SyncReport, error) {
+	if len(changes) == 0 {
+		return nil, nil, errors.New("no skill changes were provided")
 	}
 	cfg, err := config.Load(m.ConfigPath)
 	if err != nil {
-		return model.Skill{}, nil, configHint(m.ConfigPath, err)
+		return nil, nil, configHint(m.ConfigPath, err)
 	}
-	skills, _, client, err := m.discover(ctx, cfg)
+	discovered, _, client, err := m.discover(ctx, cfg)
 	if client != nil {
 		_ = client.Close()
 	}
 	if err != nil {
-		return model.Skill{}, nil, err
+		return nil, nil, err
 	}
-	skill, err := newResolver(skills).resolve(selector)
-	if err != nil {
-		return model.Skill{}, nil, err
+	resolver := newResolver(discovered)
+	resolved := make([]model.Skill, 0, len(changes))
+	desiredByID := map[string]model.InvocationState{}
+	for selector, desired := range changes {
+		if !desired.Valid() {
+			return nil, nil, fmt.Errorf("invalid invocation state %q", desired)
+		}
+		skill, resolveErr := resolver.resolve(selector)
+		if resolveErr != nil {
+			return nil, nil, resolveErr
+		}
+		if skill.Scope == model.ScopeSystem || skill.Scope == model.ScopeAdmin {
+			return nil, nil, fmt.Errorf("%s is a %s skill and is outside skillctl management", skill.ID, skill.Scope)
+		}
+		if skill.Scope == model.ScopeRepo && !project {
+			return nil, nil, errors.New("project skills require --project")
+		}
+		desiredByID[skill.ID] = desired
+		resolved = append(resolved, skill)
 	}
-	if skill.Scope == model.ScopeSystem || skill.Scope == model.ScopeAdmin {
-		return model.Skill{}, nil, fmt.Errorf("%s is a %s skill and is outside skillctl management", skill.ID, skill.Scope)
+	sort.Slice(resolved, func(i, j int) bool { return resolved[i].ID < resolved[j].ID })
+	for _, skill := range resolved {
+		cfg.SetState(skill.ID, skill.Name, desiredByID[skill.ID])
 	}
-	if skill.Scope == model.ScopeRepo && !project {
-		return model.Skill{}, nil, errors.New("project skills require --project")
-	}
-	cfg.SetState(skill.ID, skill.Name, desired)
 	if err := config.Save(m.ConfigPath, cfg); err != nil {
-		return model.Skill{}, nil, err
+		return nil, nil, err
 	}
 	if noSync {
-		return skill, nil, nil
+		return resolved, nil, nil
 	}
-	report, err := m.Sync(ctx, SyncOptions{Project: project, Selectors: []string{skill.ID}})
-	return skill, &report, err
+	selectors := make([]string, 0, len(resolved))
+	for _, skill := range resolved {
+		selectors = append(selectors, skill.ID)
+	}
+	report, err := m.Sync(ctx, SyncOptions{Project: project, Selectors: selectors})
+	return resolved, &report, err
 }
 
 func (m Manager) Sync(ctx context.Context, options SyncOptions) (model.SyncReport, error) {

@@ -29,7 +29,7 @@ policy:
 
 ## 构建和安装
 
-要求：Go 1.24+，以及可执行的 `codex` CLI。
+要求：Go 1.24.2+，以及可执行的 `codex` CLI。
 
 ```bash
 make build
@@ -44,7 +44,7 @@ make install PREFIX=/usr/local
 
 ## 首次使用
 
-初始化只创建配置，不会立即改动已安装 Skill：
+首次运行 `skillctl` 或 `skillctl tui` 会自动创建默认配置，不会立即改动已安装 Skill。也可以显式初始化：
 
 ```bash
 skillctl init
@@ -63,8 +63,17 @@ skillctl init --apply
 ## 常用命令
 
 ```bash
+# 交互管理（TTY 中不带子命令也会打开）
+skillctl
+skillctl tui
+
 # 查看所有 Skill 的实际状态和期望状态
 skillctl list
+
+# 筛选条件可以组合，条件之间是 AND
+skillctl list --state manual --scope plugin
+skillctl list --drift
+skillctl list --source vercel
 
 # 查看单个 Skill
 skillctl status grill-me
@@ -91,6 +100,30 @@ skillctl doctor
 skillctl restore grill-me
 skillctl restore --all
 ```
+
+`list` 按 `System`、`Personal`、`Plugins`、`Project`、`Other` 的固定顺序分组，每组显示状态计数和漂移数，表格列为 `NAME ACTUAL DESIRED MANAGED PATH`。在管道或脚本中不能直接运行裸 `skillctl`，请显式使用 `skillctl list` 或 `skillctl list --json`。
+
+## 交互界面
+
+TUI 左侧按来源选择范围，右侧显示 Skill 表格；窄终端会自动收起来源栏。
+
+| 按键 | 操作 |
+| --- | --- |
+| `Tab` | 切换来源栏和 Skill 表格 |
+| `j` / `k`、方向键、鼠标 | 移动选择 |
+| `←` / `→` | 切换来源 |
+| `Enter` | 展开分组或查看 Skill 详情 |
+| `/` | 搜索名称、ID、来源或路径 |
+| `i` / `m` / `d` | 暂存为 `implicit` / `manual` / `disabled` |
+| `a` | 确认并一次性应用全部暂存修改 |
+| `Esc` | 撤销当前 Skill 的暂存修改 |
+| `u` | 清空全部暂存修改 |
+| `r` | 立即刷新；界面也会自动检测外部变化 |
+| `o` | 用 `$EDITOR` 打开当前 Skill 的 `SKILL.md` |
+| `h` | 打开快捷键帮助 |
+| `q` | 退出 |
+
+外部配置或 Skill 文件变化不会静默覆盖暂存修改；基准状态变化后，该项会标为冲突并在应用时跳过。
 
 名称唯一时可以使用短名称。同名 Skill 必须使用 `skillctl list` 展示的完整 ID，例如：
 

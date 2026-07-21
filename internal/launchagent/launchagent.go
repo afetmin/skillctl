@@ -123,7 +123,7 @@ func Render(definition Definition) ([]byte, error) {
 	arguments := []string{
 		definition.Executable,
 		"--config", definition.ConfigPath,
-		"--state", definition.StatePath,
+		"--state-file", definition.StatePath,
 		"--cwd", definition.WorkingDir,
 		"watch", "--interval", definition.Interval,
 	}
