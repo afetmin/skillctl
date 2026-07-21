@@ -284,3 +284,23 @@ func TestRecordAppliedKeepsConflicts(t *testing.T) {
 		t.Fatalf("冲突项没有保留: %#v", change)
 	}
 }
+
+func TestNormalizeDescription(t *testing.T) {
+	tests := []struct {
+		name  string
+		value string
+		want  string
+	}{
+		{name: "普通描述", value: "A useful skill", want: "A useful skill"},
+		{name: "压缩空白", value: "  Build\n\nreliable\t agents  ", want: "Build reliable agents"},
+		{name: "空描述", value: " \n\t ", want: "No description"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := normalizeDescription(test.value); got != test.want {
+				t.Fatalf("normalizeDescription() = %q, want %q", got, test.want)
+			}
+		})
+	}
+}

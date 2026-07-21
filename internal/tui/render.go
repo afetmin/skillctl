@@ -14,25 +14,30 @@ import (
 )
 
 var (
-	titleStyle            = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("39"))
-	mutedStyle            = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
-	headingStyle          = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("252"))
-	selectedStyle         = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("231")).Background(lipgloss.Color("24"))
-	selectedPendingStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("220")).Background(lipgloss.Color("24"))
-	selectedConflictStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("203")).Background(lipgloss.Color("24"))
-	footerKeyStyle        = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("228"))
-	footerTextStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
-	helpStyle             = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("39")).Padding(1, 2)
-	groupStyle            = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("75"))
-	warnStyle             = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
-	driftStyle            = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
-	pendingStyle          = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("220"))
-	conflictStyle         = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("203"))
-	errorStyle            = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
-	successStyle          = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
+	titleStyle               = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("39"))
+	mutedStyle               = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
+	headingStyle             = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("252"))
+	selectedStyle            = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("231")).Background(lipgloss.Color("24"))
+	selectedPendingStyle     = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("220")).Background(lipgloss.Color("24"))
+	selectedConflictStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("203")).Background(lipgloss.Color("24"))
+	selectedDescriptionStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("250")).Background(lipgloss.Color("24"))
+	footerKeyStyle           = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("228"))
+	footerTextStyle          = lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
+	helpStyle                = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("39")).Padding(1, 2)
+	groupStyle               = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("75"))
+	warnStyle                = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
+	driftStyle               = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
+	pendingStyle             = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("220"))
+	conflictStyle            = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("203"))
+	errorStyle               = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
+	successStyle             = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
 )
 
-const stateColumnWidth = 23
+const (
+	stateColumnWidth          = 23
+	minNameColumnWidth        = 8
+	minDescriptionColumnWidth = 24
+)
 
 func (m uiModel) View() string {
 	if m.width <= 0 || m.height <= 0 {
@@ -167,30 +172,31 @@ func (m uiModel) tableView(width, height int) []string {
 }
 
 func (m uiModel) tableHeader(width int) string {
-	nameWidth, pathWidth, showPath := m.tableWidths(width)
+	nameWidth, descriptionWidth := m.tableWidths(width)
 	header := padRight("NAME", nameWidth) + " " + padRight("STATE", stateColumnWidth)
-	if showPath {
-		header += " " + padRight("PATH", pathWidth)
+	if descriptionWidth > 0 {
+		header += " " + padRight("DESCRIPTION", descriptionWidth)
 	}
 	return fitLine(header, width)
 }
 
 func (m uiModel) skillLine(skill service.SkillStatus, width int, selected bool) string {
 	presentation := m.presentationFor(skill)
-	nameWidth, pathWidth, showPath := m.tableWidths(width)
+	nameWidth, descriptionWidth := m.tableWidths(width)
 	nameWidth = max(3, nameWidth)
 	nameText := presentation.Marker + " " + padRight(truncateEnd(skill.Name, nameWidth-2), nameWidth-2)
+	description := padRight(truncateEnd(normalizeDescription(skill.Description), descriptionWidth), descriptionWidth)
 	if selected {
 		line := selectedStyle.Render(nameText) + selectedStyle.Render(" ") + renderSelectedState(skill.Actual, presentation, stateColumnWidth)
-		if showPath {
-			line += selectedStyle.Render(" " + middleTruncate(skill.Path, pathWidth))
+		if descriptionWidth > 0 {
+			line += selectedStyle.Render(" ") + selectedDescriptionStyle.Render(description)
 		}
 		return line
 	}
 	name := renderMarker(presentation.Marker) + " " + padRight(truncateEnd(skill.Name, nameWidth-2), nameWidth-2)
 	line := name + " " + padRight(renderState(skill.Actual, presentation), stateColumnWidth)
-	if showPath {
-		line += " " + middleTruncate(skill.Path, pathWidth)
+	if descriptionWidth > 0 {
+		line += " " + mutedStyle.Render(description)
 	}
 	return fitLine(line, width)
 }
@@ -321,7 +327,11 @@ func (m uiModel) detailView() string {
 		)
 	}
 	lines = append(lines, "", headingStyle.Render("Description"))
-	lines = append(lines, wrapText(skill.Description, max(20, m.width-2))...)
+	description := strings.TrimSpace(skill.Description)
+	if description == "" {
+		description = "No description"
+	}
+	lines = append(lines, wrapText(description, max(20, m.width-2))...)
 	lines = append(lines, "", mutedStyle.Render("j/k scroll  o open in editor  Esc/Enter back"))
 	visible := max(1, m.height)
 	start := clamp(m.detailOffset, 0, max(0, len(lines)-visible))
@@ -349,21 +359,24 @@ func (m uiModel) visibleRowCount() int {
 	return max(1, m.mainHeight()-2)
 }
 
-func (m uiModel) tableWidths(width int) (nameWidth, pathWidth int, showPath bool) {
-	const fixed = 1 + stateColumnWidth
-	availableNameWidth := max(8, width-fixed)
+func (m uiModel) tableWidths(width int) (nameWidth, descriptionWidth int) {
+	nameBudget := max(minNameColumnWidth, width-stateColumnWidth-1)
 	desiredNameWidth := lipgloss.Width("NAME")
 	for _, row := range m.rows {
 		if row.Kind == rowSkill {
 			desiredNameWidth = max(desiredNameWidth, lipgloss.Width(row.Skill.Name)+2)
 		}
 	}
-	nameWidth = min(desiredNameWidth, availableNameWidth)
-	pathWidth = width - fixed - nameWidth - 1
-	if pathWidth < 8 {
-		return availableNameWidth, 0, false
+	nameWidth = min(desiredNameWidth, nameBudget)
+	descriptionWidth = width - nameWidth - stateColumnWidth - 2
+	if descriptionWidth < minDescriptionColumnWidth {
+		nameWidth = max(minNameColumnWidth, nameWidth-(minDescriptionColumnWidth-descriptionWidth))
+		descriptionWidth = width - nameWidth - stateColumnWidth - 2
 	}
-	return nameWidth, pathWidth, true
+	if descriptionWidth <= 0 {
+		return nameBudget, 0
+	}
+	return nameWidth, descriptionWidth
 }
 
 func stateMarker(state model.InvocationState) string {
@@ -425,6 +438,14 @@ func renderSelectedState(current model.InvocationState, presentation skillPresen
 	}
 	padding := strings.Repeat(" ", max(0, width-lipgloss.Width(prefix)-lipgloss.Width(target)))
 	return selectedStyle.Render(prefix) + targetStyle.Render(target) + selectedStyle.Render(padding)
+}
+
+func normalizeDescription(value string) string {
+	description := strings.Join(strings.Fields(value), " ")
+	if description == "" {
+		return "No description"
+	}
+	return description
 }
 
 func summarizeGroups(groups []inventory.Group) inventory.Summary {
@@ -525,23 +546,4 @@ func truncateEnd(value string, width int) string {
 		return value
 	}
 	return ansi.Truncate(value, width, "…")
-}
-
-func middleTruncate(value string, width int) string {
-	if width <= 0 || lipgloss.Width(value) <= width {
-		return truncateEnd(value, width)
-	}
-	if width < 5 {
-		return truncateEnd(value, width)
-	}
-	runes := []rune(value)
-	leftCount := (width - 1) / 2
-	rightCount := width - 1 - leftCount
-	left := strings.TrimSuffix(truncateEnd(string(runes), leftCount), "…")
-	right := string(runes)
-	for lipgloss.Width(right) > rightCount && len([]rune(right)) > 0 {
-		rightRunes := []rune(right)
-		right = string(rightRunes[1:])
-	}
-	return padRight(left+"…"+right, width)
 }

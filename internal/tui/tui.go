@@ -133,7 +133,7 @@ type editorDoneMsg struct {
 func Run(ctx context.Context, options Options) error {
 	search := textinput.New()
 	search.Prompt = "/ "
-	search.Placeholder = "Search name, ID, source, or path"
+	search.Placeholder = "Search name, description, ID, source, or path"
 	search.CharLimit = 256
 	search.Width = 48
 

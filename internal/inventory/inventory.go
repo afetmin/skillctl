@@ -79,7 +79,7 @@ func Apply(items []service.SkillStatus, filter Filter) []service.SkillStatus {
 			continue
 		}
 		if query != "" {
-			haystack := strings.ToLower(strings.Join([]string{item.Name, item.ID, item.Source, item.Path}, "\n"))
+			haystack := strings.ToLower(strings.Join([]string{item.Name, item.Description, item.ID, item.Source, item.Path}, "\n"))
 			if !strings.Contains(haystack, query) {
 				continue
 			}
