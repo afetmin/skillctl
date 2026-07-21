@@ -21,8 +21,12 @@ var (
 	selectedPendingStyle     = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("220")).Background(lipgloss.Color("24"))
 	selectedConflictStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("203")).Background(lipgloss.Color("24"))
 	selectedDescriptionStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("250")).Background(lipgloss.Color("24"))
+	focusedStateStyle        = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("231")).Background(lipgloss.Color("33"))
 	footerKeyStyle           = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("228"))
 	footerTextStyle          = lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
+	disabledFooterStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
+	dangerStyle              = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("203"))
+	selectedDangerStyle      = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("231")).Background(lipgloss.Color("160"))
 	helpStyle                = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("39")).Padding(1, 2)
 	groupStyle               = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("75"))
 	warnStyle                = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
@@ -37,6 +41,7 @@ const (
 	stateColumnWidth          = 23
 	minNameColumnWidth        = 8
 	minDescriptionColumnWidth = 24
+	deleteFooterWidth         = 8
 )
 
 func (m uiModel) View() string {
@@ -45,6 +50,9 @@ func (m uiModel) View() string {
 	}
 	if m.help {
 		return m.helpView()
+	}
+	if m.deleteConfirm {
+		return m.deleteConfirmView()
 	}
 	if m.confirm {
 		return m.confirmView()
@@ -61,6 +69,7 @@ func (m uiModel) mainView() string {
 	if m.searching {
 		lines = append(lines, m.searchInputView())
 	}
+	lines = append(lines, m.statusFilterView())
 	right := m.tableView(rightWidth, mainHeight)
 	if leftWidth == 0 {
 		lines = append(lines, right...)
@@ -106,7 +115,7 @@ func (m uiModel) searchView() string {
 	if query == "" {
 		query = "none"
 	}
-	line := mutedStyle.Render("Status: ") + m.selectedStateLabel() + mutedStyle.Render(" · Source: ") + m.selectedSourceLabel() + mutedStyle.Render(" · Search: ") + query
+	line := mutedStyle.Render("Source: ") + m.selectedSourceLabel() + mutedStyle.Render(" · Search: ") + query
 	return fitLine(line, m.width)
 }
 
@@ -130,16 +139,28 @@ func (m uiModel) selectedSourceLabel() string {
 	return "All"
 }
 
-func (m uiModel) filterView(width, height int) []string {
-	lines := []string{headingStyle.Render("STATUS")}
+func (m uiModel) statusFilterView() string {
+	parts := []string{headingStyle.Render("STATUS")}
 	for index, option := range m.states {
-		line := padRight("  "+option.Label, width-5) + fmt.Sprintf("%4d", option.Count)
-		if m.focus == focusState && index == m.stateIndex {
-			line = selectedStyle.Render(fitLine(line, width))
+		text := stateOptionText(option)
+		if index == m.stateIndex {
+			if m.focus == focusState {
+				text = focusedStateStyle.Render(text)
+			} else {
+				text = selectedStyle.Render(text)
+			}
 		}
-		lines = append(lines, line)
+		parts = append(parts, text)
 	}
-	lines = append(lines, "", headingStyle.Render("SOURCES"))
+	return fitLine(strings.Join(parts, " "), m.width)
+}
+
+func stateOptionText(option inventory.StateOption) string {
+	return fmt.Sprintf(" %s %d ", option.Label, option.Count)
+}
+
+func (m uiModel) filterView(width, height int) []string {
+	lines := []string{headingStyle.Render("SOURCES")}
 	available := max(0, height-sidebarSourceOptionTop)
 	end := min(len(m.sources), m.sourceOffset+available)
 	for index := m.sourceOffset; index < end; index++ {
@@ -238,14 +259,19 @@ func (m uiModel) footerView() string {
 	}
 	if leftWidth, _, _, _ := m.layout(); leftWidth == 0 {
 		hints = []keyHint{
-			{"[/]", "status"}, {"←/→", "source"}, {"↑/↓", "move"}, {"Enter", "open"},
+			{"[/]", "status"}, {"Tab", "pane"}, {"↑/↓", "move"}, {"Enter", "open"},
 			{"a", "apply"}, {"/", "search"}, {"h", "help"}, {"q", "quit"},
 		}
 	}
-	keys := renderKeyHints(hints)
-	if status != "" {
-		keys = status + "  |  " + keys
+	deleteHint := disabledFooterStyle.Render("x Delete")
+	if skill, ok := m.currentSkill(); ok && deleteBlockedReason(skill) == "" && !m.loading && !m.applying && !m.deleting {
+		deleteHint = footerKeyStyle.Render("x") + " " + footerTextStyle.Render("Delete")
 	}
+	keys := deleteHint
+	if status != "" {
+		keys += "  |  " + status
+	}
+	keys += "  |  " + renderKeyHints(hints)
 	return fitLine(keys, m.width)
 }
 
@@ -271,7 +297,7 @@ func (m uiModel) helpView() string {
 		helpLine("Tab / Shift+Tab", "Switch pane", contentWidth),
 		helpLine("↑ / ↓ or j / k", "Move selection", contentWidth),
 		helpLine("[ / ]", "Change status filter", contentWidth),
-		helpLine("← / →", "Change source", contentWidth),
+		helpLine("← / →", "Change focused status or source", contentWidth),
 		helpLine("PgUp / PgDn", "Move one page", contentWidth),
 		helpLine("Home / End", "Jump to first or last item", contentWidth),
 		"",
@@ -284,7 +310,8 @@ func (m uiModel) helpView() string {
 		helpLine("Enter", "Open skill or toggle group", contentWidth),
 		helpLine("i / m / d", "Stage implicit, manual, or disabled", contentWidth),
 		helpLine("a / u / Esc", "Apply, clear all, or undo current", contentWidth),
-		helpLine("/ / r / o", "Search, refresh, or open in editor", contentWidth),
+		helpLine("x / r / o", "Delete, refresh, or open in editor", contentWidth),
+		helpLine("/", "Search skills", contentWidth),
 		headingStyle.Render("Windows"),
 		helpLine("Detail", "j/k scroll, o editor, Esc/Enter back", contentWidth),
 		helpLine("Search", "Enter accept, Esc clear", contentWidth),
@@ -297,6 +324,91 @@ func (m uiModel) helpView() string {
 	}
 	modal := helpStyle.Width(contentWidth).Render(strings.Join(lines, "\n"))
 	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, modal)
+}
+
+func (m uiModel) deleteConfirmView() string {
+	if m.height < 2 {
+		return fitScreen([]string{titleStyle.Render("Delete skill?")}, m.width, m.height)
+	}
+	content := m.deleteConfirmLines()
+	visible := m.deleteVisibleCount()
+	start := clamp(m.deleteOffset, 0, max(0, len(content)-visible))
+	end := min(len(content), start+visible)
+	lines := append([]string(nil), content[start:end]...)
+	for len(lines) < visible {
+		lines = append(lines, "")
+	}
+	cancel := "[ Cancel ]"
+	deleteButton := dangerStyle.Render("[ Delete ]")
+	if m.deleteChoice == deleteChoiceCancel {
+		cancel = selectedStyle.Render(cancel)
+	} else {
+		deleteButton = selectedDangerStyle.Render("[ Delete ]")
+	}
+	_, cancelStart, _, _, _ := m.deleteButtonLayout()
+	buttons := strings.Repeat(" ", cancelStart) + cancel + "    " + deleteButton
+	lines = append(lines, fitLine(buttons, m.width))
+	hint := mutedStyle.Render("↑/↓ scroll · ←/→ or Tab choose · Enter confirm · Esc cancel")
+	if m.deleting {
+		hint = m.spinner.View() + " deleting " + m.deleteSkill.Name
+	}
+	lines = append(lines, fitLine(hint, m.width))
+	return fitScreen(lines, m.width, m.height)
+}
+
+func (m uiModel) deleteConfirmLines() []string {
+	contentWidth := max(20, min(76, m.width-4))
+	lines := []string{
+		titleStyle.Render("Delete skill?"),
+		"",
+		field("Name", m.deleteSkill.Name),
+	}
+	lines = append(lines, wrapFullText("Path: "+m.deleteSkill.Path, contentWidth)...)
+	if _, pending := m.pending[m.deleteSkill.ID]; pending {
+		lines = append(lines, "", warnStyle.Render("This skill has a pending change; it will be cleared after deletion."))
+	}
+	if m.deleteErr != nil {
+		lines = append(lines, "", errorStyle.Render("Delete failed: "+m.deleteErr.Error()))
+	}
+	return lines
+}
+
+func (m uiModel) deleteVisibleCount() int {
+	return max(1, m.height-2)
+}
+
+func (m uiModel) deleteMaxOffset() int {
+	return max(0, len(m.deleteConfirmLines())-m.deleteVisibleCount())
+}
+
+func (m uiModel) deleteButtonLayout() (y, cancelStart, cancelEnd, deleteStart, deleteEnd int) {
+	cancelWidth := lipgloss.Width("[ Cancel ]")
+	deleteWidth := lipgloss.Width("[ Delete ]")
+	total := cancelWidth + 4 + deleteWidth
+	start := max(0, (m.width-total)/2)
+	return max(0, m.height-2), start, start + cancelWidth, start + cancelWidth + 4, start + total
+}
+
+// wrapFullText 强制换行但不截断内容，用于必须完整展示的路径。
+func wrapFullText(value string, width int) []string {
+	width = max(1, width)
+	var lines []string
+	var line strings.Builder
+	lineWidth := 0
+	for _, char := range value {
+		charWidth := lipgloss.Width(string(char))
+		if lineWidth > 0 && lineWidth+charWidth > width {
+			lines = append(lines, line.String())
+			line.Reset()
+			lineWidth = 0
+		}
+		line.WriteRune(char)
+		lineWidth += charWidth
+	}
+	if line.Len() > 0 {
+		lines = append(lines, line.String())
+	}
+	return lines
 }
 
 func helpLine(key, description string, width int) string {
@@ -376,7 +488,7 @@ func (m uiModel) detailView() string {
 }
 
 func (m uiModel) layout() (leftWidth, rightWidth, mainTop, mainHeight int) {
-	mainTop = 2
+	mainTop = 3
 	if m.searching {
 		mainTop++
 	}

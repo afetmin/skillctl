@@ -39,8 +39,12 @@ const (
 )
 
 const (
-	sidebarStateOptionTop  = 1
-	sidebarSourceOptionTop = 7
+	sidebarSourceOptionTop = 1
+)
+
+const (
+	deleteChoiceCancel = iota
+	deleteChoiceConfirm
 )
 
 type tableRow struct {
@@ -107,15 +111,23 @@ type uiModel struct {
 	pending      map[string]pendingChange
 	applied      map[string]bool
 
-	search        textinput.Model
-	searching     bool
-	help          bool
-	detail        bool
-	detailOffset  int
-	confirm       bool
-	confirmOffset int
-	applying      bool
-	loading       bool
+	search          textinput.Model
+	searching       bool
+	help            bool
+	detail          bool
+	detailOffset    int
+	confirm         bool
+	confirmOffset   int
+	applying        bool
+	loading         bool
+	deleteConfirm   bool
+	deleteChoice    int
+	deleteSkill     service.SkillStatus
+	deleteNextID    string
+	deleteOffset    int
+	selectAfterLoad string
+	deleteErr       error
+	deleting        bool
 
 	spinner     spinner.Model
 	status      string
@@ -142,6 +154,11 @@ type fingerprintMsg struct {
 
 type editorDoneMsg struct {
 	err error
+}
+
+type deletedMsg struct {
+	skill service.SkillStatus
+	err   error
 }
 
 func Run(ctx context.Context, options Options) error {
@@ -194,11 +211,12 @@ func (m uiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
-		if leftWidth, _, _, _ := m.layout(); leftWidth == 0 {
+		if leftWidth, _, _, _ := m.layout(); leftWidth == 0 && m.focus == focusSource {
 			m.focus = focusTable
 		}
 		m.ensureVisible()
 		m.confirmOffset = clamp(m.confirmOffset, 0, m.confirmMaxOffset())
+		m.deleteOffset = clamp(m.deleteOffset, 0, m.deleteMaxOffset())
 		return m, nil
 	case spinner.TickMsg:
 		m.spinner, _ = m.spinner.Update(msg)
@@ -232,6 +250,25 @@ func (m uiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.status += fmt.Sprintf("; %d conflicts remain", conflicts)
 		}
 		return m, m.loadCmd()
+	case deletedMsg:
+		m.deleting = false
+		if msg.err != nil {
+			m.deleteErr = msg.err
+			m.deleteOffset = m.deleteMaxOffset()
+			m.status = "Delete: " + msg.err.Error()
+			return m, nil
+		}
+		delete(m.pending, msg.skill.ID)
+		delete(m.applied, msg.skill.ID)
+		m.deleteConfirm = false
+		m.selectAfterLoad = m.deleteNextID
+		m.deleteNextID = ""
+		m.deleteOffset = 0
+		m.deleteSkill = service.SkillStatus{}
+		m.deleteErr = nil
+		m.loading = true
+		m.status = "Deleted " + msg.skill.Name
+		return m, m.loadCmd()
 	case fingerprintMsg:
 		commands = append(commands, m.fingerprintCmd())
 		if msg.err != nil {
@@ -242,7 +279,7 @@ func (m uiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.fingerprint = msg.value
 			return m, tea.Batch(commands...)
 		}
-		if msg.value != m.fingerprint && !m.loading && !m.applying {
+		if msg.value != m.fingerprint && !m.loading && !m.applying && !m.deleting {
 			m.fingerprint = msg.value
 			m.loading = true
 			commands = append(commands, m.loadCmd())
@@ -270,6 +307,9 @@ func (m uiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.help = true
 			return m, nil
 		}
+		if m.deleteConfirm {
+			return m.updateDeleteConfirm(msg)
+		}
 		if m.confirm {
 			return m.updateConfirm(msg)
 		}
@@ -286,18 +326,10 @@ func (m uiModel) updateMain(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "ctrl+c", "q":
 		return m, tea.Quit
 	case "tab":
-		if leftWidth, _, _, _ := m.layout(); leftWidth == 0 {
-			m.focus = focusTable
-		} else {
-			m.focus = (m.focus + 1) % 3
-		}
+		m.moveFocus(1)
 		return m, nil
 	case "shift+tab":
-		if leftWidth, _, _, _ := m.layout(); leftWidth == 0 {
-			m.focus = focusTable
-		} else {
-			m.focus = (m.focus + 2) % 3
-		}
+		m.moveFocus(-1)
 		return m, nil
 	case "/":
 		m.searching = true
@@ -332,11 +364,17 @@ func (m uiModel) updateMain(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.stageCurrent(model.StateManual), nil
 	case "d":
 		return m.stageCurrent(model.StateDisabled), nil
+	case "x":
+		return m.beginDelete()
 	case "o":
 		return m, m.openEditorCmd()
 	case "enter":
 		if m.focus == focusState {
-			m.focus = focusSource
+			if leftWidth, _, _, _ := m.layout(); leftWidth == 0 {
+				m.focus = focusTable
+			} else {
+				m.focus = focusSource
+			}
 			return m, nil
 		}
 		if m.focus == focusSource {
@@ -355,29 +393,33 @@ func (m uiModel) updateMain(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "up", "k":
 		switch m.focus {
-		case focusState:
-			m.moveState(-1)
 		case focusSource:
 			m.moveSource(-1)
-		default:
+		case focusTable:
 			m.moveRow(-1)
 		}
 		return m, nil
 	case "down", "j":
 		switch m.focus {
-		case focusState:
-			m.moveState(1)
 		case focusSource:
 			m.moveSource(1)
-		default:
+		case focusTable:
 			m.moveRow(1)
 		}
 		return m, nil
 	case "left":
-		m.moveSource(-1)
+		if m.focus == focusState {
+			m.moveState(-1)
+		} else if m.focus == focusSource {
+			m.moveSource(-1)
+		}
 		return m, nil
 	case "right":
-		m.moveSource(1)
+		if m.focus == focusState {
+			m.moveState(1)
+		} else if m.focus == focusSource {
+			m.moveSource(1)
+		}
 		return m, nil
 	case "[":
 		m.moveState(-1)
@@ -419,6 +461,25 @@ func (m uiModel) updateMain(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	return m, nil
+}
+
+func (m *uiModel) moveFocus(delta int) {
+	order := []int{focusState, focusSource, focusTable}
+	if leftWidth, _, _, _ := m.layout(); leftWidth == 0 {
+		order = []int{focusState, focusTable}
+	}
+	current := 0
+	for index, focus := range order {
+		if focus == m.focus {
+			current = index
+			break
+		}
+	}
+	next := (current + delta) % len(order)
+	if next < 0 {
+		next += len(order)
+	}
+	m.focus = order[next]
 }
 
 func (m uiModel) updateHelp(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -483,6 +544,116 @@ func (m uiModel) updateConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+func (m uiModel) updateDeleteConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.deleting {
+		if msg.String() == "esc" {
+			m.status = "Deletion is already in progress"
+		}
+		return m, nil
+	}
+	switch msg.String() {
+	case "esc", "q":
+		m.closeDeleteConfirm()
+		return m, nil
+	case "left", "right", "tab", "shift+tab":
+		if m.deleteChoice == deleteChoiceCancel {
+			m.deleteChoice = deleteChoiceConfirm
+		} else {
+			m.deleteChoice = deleteChoiceCancel
+		}
+		return m, nil
+	case "up", "k":
+		m.moveDeleteOffset(-1)
+		return m, nil
+	case "down", "j":
+		m.moveDeleteOffset(1)
+		return m, nil
+	case "pgup":
+		m.moveDeleteOffset(-m.deleteVisibleCount())
+		return m, nil
+	case "pgdown":
+		m.moveDeleteOffset(m.deleteVisibleCount())
+		return m, nil
+	case "home":
+		m.deleteOffset = 0
+		return m, nil
+	case "end":
+		m.deleteOffset = m.deleteMaxOffset()
+		return m, nil
+	case "enter":
+		if m.deleteChoice == deleteChoiceCancel {
+			m.closeDeleteConfirm()
+			return m, nil
+		}
+		m.deleting = true
+		m.deleteErr = nil
+		m.status = "Deleting " + m.deleteSkill.Name
+		return m, m.deleteCmd()
+	}
+	return m, nil
+}
+
+func (m *uiModel) closeDeleteConfirm() {
+	m.deleteConfirm = false
+	m.deleteChoice = deleteChoiceCancel
+	m.deleteSkill = service.SkillStatus{}
+	m.deleteNextID = ""
+	m.deleteOffset = 0
+	m.deleteErr = nil
+}
+
+func (m uiModel) beginDelete() (tea.Model, tea.Cmd) {
+	if m.loading || m.applying || m.deleting {
+		m.status = "Wait for the current operation to finish"
+		return m, nil
+	}
+	skill, ok := m.currentSkill()
+	if !ok {
+		m.status = "Select a skill to delete"
+		return m, nil
+	}
+	if reason := deleteBlockedReason(skill); reason != "" {
+		m.status = reason
+		return m, nil
+	}
+	m.deleteConfirm = true
+	m.deleteChoice = deleteChoiceCancel
+	m.deleteSkill = skill
+	m.deleteNextID = m.adjacentSkillID()
+	m.deleteOffset = 0
+	m.deleteErr = nil
+	return m, nil
+}
+
+func deleteBlockedReason(skill service.SkillStatus) string {
+	switch skill.Scope {
+	case model.ScopeUser, model.ScopeRepo:
+		return ""
+	case model.ScopeSystem:
+		return "System skills cannot be deleted"
+	case model.ScopePlugin:
+		return "Plugin skills cannot be deleted"
+	case model.ScopeAdmin:
+		return "Admin skills cannot be deleted"
+	default:
+		return "Skills from this source cannot be deleted"
+	}
+}
+
+func (m uiModel) adjacentSkillID() string {
+	for index := m.rowIndex + 1; index < len(m.rows); index++ {
+		if m.rows[index].Kind == rowSkill {
+			return m.rows[index].Skill.ID
+		}
+	}
+	for index := m.rowIndex - 1; index >= 0; index-- {
+		if m.rows[index].Kind == rowSkill {
+			return m.rows[index].Skill.ID
+		}
+	}
+	return ""
+}
+
 func (m *uiModel) moveConfirm(delta int) {
 	m.confirmOffset = clamp(m.confirmOffset+delta, 0, m.confirmMaxOffset())
 }
@@ -519,6 +690,9 @@ func (m uiModel) handleMouse(event tea.MouseEvent) (tea.Model, tea.Cmd) {
 	if m.help {
 		return m, nil
 	}
+	if m.deleteConfirm {
+		return m.handleDeleteMouse(event)
+	}
 	if m.confirm {
 		switch event.Button {
 		case tea.MouseButtonWheelUp:
@@ -537,6 +711,18 @@ func (m uiModel) handleMouse(event tea.MouseEvent) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	}
+	if event.Action == tea.MouseActionPress && event.Button == tea.MouseButtonLeft && event.Y == m.height-1 && event.X >= 0 && event.X < deleteFooterWidth {
+		return m.beginDelete()
+	}
+	statusY := m.statusFilterY()
+	if event.Action == tea.MouseActionPress && event.Button == tea.MouseButtonLeft && event.Y == statusY {
+		if index := m.stateIndexAtX(event.X); index >= 0 {
+			m.focus = focusState
+			m.stateIndex = index
+			m.selectState()
+		}
+		return m, nil
+	}
 	leftWidth, _, mainTop, _ := m.layout()
 	if event.Button == tea.MouseButtonWheelUp || event.Button == tea.MouseButtonWheelDown {
 		delta := 3
@@ -544,14 +730,8 @@ func (m uiModel) handleMouse(event tea.MouseEvent) (tea.Model, tea.Cmd) {
 			delta = -3
 		}
 		if event.X < leftWidth {
-			localY := event.Y - mainTop
-			if localY >= sidebarStateOptionTop && localY < sidebarStateOptionTop+len(m.states) {
-				m.focus = focusState
-				m.moveState(delta)
-			} else {
-				m.focus = focusSource
-				m.moveSource(delta)
-			}
+			m.focus = focusSource
+			m.moveSource(delta)
 		} else {
 			m.focus = focusTable
 			m.moveRow(delta)
@@ -563,13 +743,6 @@ func (m uiModel) handleMouse(event tea.MouseEvent) (tea.Model, tea.Cmd) {
 	}
 	localY := event.Y - mainTop
 	if event.X < leftWidth {
-		stateIndex := localY - sidebarStateOptionTop
-		if stateIndex >= 0 && stateIndex < len(m.states) {
-			m.focus = focusState
-			m.stateIndex = stateIndex
-			m.selectState()
-			return m, nil
-		}
 		index := m.sourceOffset + localY - sidebarSourceOptionTop
 		if index >= 0 && index < len(m.sources) {
 			m.focus = focusSource
@@ -585,6 +758,63 @@ func (m uiModel) handleMouse(event tea.MouseEvent) (tea.Model, tea.Cmd) {
 		m.ensureVisible()
 	}
 	return m, nil
+}
+
+func (m uiModel) handleDeleteMouse(event tea.MouseEvent) (tea.Model, tea.Cmd) {
+	if m.deleting {
+		return m, nil
+	}
+	switch event.Button {
+	case tea.MouseButtonWheelUp:
+		m.moveDeleteOffset(-3)
+		return m, nil
+	case tea.MouseButtonWheelDown:
+		m.moveDeleteOffset(3)
+		return m, nil
+	}
+	if event.Action != tea.MouseActionPress || event.Button != tea.MouseButtonLeft {
+		return m, nil
+	}
+	y, cancelStart, cancelEnd, deleteStart, deleteEnd := m.deleteButtonLayout()
+	if event.Y != y {
+		return m, nil
+	}
+	if event.X >= cancelStart && event.X < cancelEnd {
+		m.closeDeleteConfirm()
+		return m, nil
+	}
+	if event.X >= deleteStart && event.X < deleteEnd {
+		m.deleteChoice = deleteChoiceConfirm
+		m.deleting = true
+		m.deleteErr = nil
+		m.status = "Deleting " + m.deleteSkill.Name
+		return m, m.deleteCmd()
+	}
+	return m, nil
+}
+
+func (m *uiModel) moveDeleteOffset(delta int) {
+	m.deleteOffset = clamp(m.deleteOffset+delta, 0, m.deleteMaxOffset())
+}
+
+func (m uiModel) statusFilterY() int {
+	y := 2
+	if m.searching {
+		y++
+	}
+	return y
+}
+
+func (m uiModel) stateIndexAtX(x int) int {
+	cursor := lipgloss.Width("STATUS ")
+	for index, option := range m.states {
+		width := lipgloss.Width(stateOptionText(option))
+		if x >= cursor && x < cursor+width {
+			return index
+		}
+		cursor += width + 1
+	}
+	return -1
 }
 
 func (m *uiModel) applyLoaded(items []service.SkillStatus, warnings []string) {
@@ -610,7 +840,9 @@ func (m *uiModel) applyLoaded(items []service.SkillStatus, warnings []string) {
 		}
 	}
 	m.reconcileApplied(items)
-	m.rebuild("")
+	preferredSkill := m.selectAfterLoad
+	m.selectAfterLoad = ""
+	m.rebuild(preferredSkill)
 	if len(warnings) > 0 {
 		m.status = fmt.Sprintf("Loaded %d skills with %d warnings", len(items), len(warnings))
 	} else {
@@ -885,6 +1117,14 @@ func (m uiModel) applyCmd() tea.Cmd {
 			return appliedMsg{err: err}
 		}
 		return appliedMsg{report: *report, err: err}
+	}
+}
+
+func (m uiModel) deleteCmd() tea.Cmd {
+	skill := m.deleteSkill
+	return func() tea.Msg {
+		err := m.manager.DeleteSkill(skill.Skill)
+		return deletedMsg{skill: skill, err: err}
 	}
 }
 
