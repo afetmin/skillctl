@@ -32,6 +32,17 @@ const (
 	rowSkill
 )
 
+const (
+	focusState = iota
+	focusSource
+	focusTable
+)
+
+const (
+	sidebarStateOptionTop  = 1
+	sidebarSourceOptionTop = 7
+)
+
 type tableRow struct {
 	Kind     rowKind
 	Group    inventory.Group
@@ -83,9 +94,11 @@ type uiModel struct {
 	items    []service.SkillStatus
 	warnings []string
 	groups   []inventory.Group
+	states   []inventory.StateOption
 	sources  []inventory.SourceOption
 	rows     []tableRow
 
+	stateIndex   int
 	sourceIndex  int
 	sourceOffset int
 	rowIndex     int
@@ -134,7 +147,7 @@ type editorDoneMsg struct {
 func Run(ctx context.Context, options Options) error {
 	search := textinput.New()
 	search.Prompt = "/ "
-	search.Placeholder = "Search name, description, ID, source, or path"
+	search.Placeholder = "Search name, description, ID, or path"
 	search.CharLimit = 256
 	search.Width = 48
 
@@ -146,6 +159,8 @@ func Run(ctx context.Context, options Options) error {
 		ctx:       ctx,
 		manager:   options.Manager,
 		project:   options.Project,
+		states:    inventory.StateOptions(nil, inventory.Filter{}),
+		sources:   inventory.SourceOptions(nil, inventory.Filter{}),
 		collapsed: map[string]bool{},
 		pending:   map[string]pendingChange{},
 		applied:   map[string]bool{},
@@ -179,6 +194,9 @@ func (m uiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+		if leftWidth, _, _, _ := m.layout(); leftWidth == 0 {
+			m.focus = focusTable
+		}
 		m.ensureVisible()
 		m.confirmOffset = clamp(m.confirmOffset, 0, m.confirmMaxOffset())
 		return m, nil
@@ -267,11 +285,18 @@ func (m uiModel) updateMain(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "ctrl+c", "q":
 		return m, tea.Quit
-	case "tab", "shift+tab":
-		if m.focus == 0 {
-			m.focus = 1
+	case "tab":
+		if leftWidth, _, _, _ := m.layout(); leftWidth == 0 {
+			m.focus = focusTable
 		} else {
-			m.focus = 0
+			m.focus = (m.focus + 1) % 3
+		}
+		return m, nil
+	case "shift+tab":
+		if leftWidth, _, _, _ := m.layout(); leftWidth == 0 {
+			m.focus = focusTable
+		} else {
+			m.focus = (m.focus + 2) % 3
 		}
 		return m, nil
 	case "/":
@@ -310,8 +335,12 @@ func (m uiModel) updateMain(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "o":
 		return m, m.openEditorCmd()
 	case "enter":
-		if m.focus == 0 {
-			m.focus = 1
+		if m.focus == focusState {
+			m.focus = focusSource
+			return m, nil
+		}
+		if m.focus == focusSource {
+			m.focus = focusTable
 			return m, nil
 		}
 		if row, ok := m.currentRow(); ok {
@@ -325,16 +354,22 @@ func (m uiModel) updateMain(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case "up", "k":
-		if m.focus == 0 {
+		switch m.focus {
+		case focusState:
+			m.moveState(-1)
+		case focusSource:
 			m.moveSource(-1)
-		} else {
+		default:
 			m.moveRow(-1)
 		}
 		return m, nil
 	case "down", "j":
-		if m.focus == 0 {
+		switch m.focus {
+		case focusState:
+			m.moveState(1)
+		case focusSource:
 			m.moveSource(1)
-		} else {
+		default:
 			m.moveRow(1)
 		}
 		return m, nil
@@ -344,6 +379,12 @@ func (m uiModel) updateMain(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "right":
 		m.moveSource(1)
 		return m, nil
+	case "[":
+		m.moveState(-1)
+		return m, nil
+	case "]":
+		m.moveState(1)
+		return m, nil
 	case "pgup":
 		m.moveRow(-m.visibleRowCount())
 		return m, nil
@@ -351,19 +392,27 @@ func (m uiModel) updateMain(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.moveRow(m.visibleRowCount())
 		return m, nil
 	case "home":
-		if m.focus == 0 {
+		switch m.focus {
+		case focusState:
+			m.stateIndex = 0
+			m.selectState()
+		case focusSource:
 			m.sourceIndex = 0
 			m.selectSource()
-		} else {
+		default:
 			m.rowIndex = 0
 			m.ensureVisible()
 		}
 		return m, nil
 	case "end":
-		if m.focus == 0 {
+		switch m.focus {
+		case focusState:
+			m.stateIndex = max(0, len(m.states)-1)
+			m.selectState()
+		case focusSource:
 			m.sourceIndex = max(0, len(m.sources)-1)
 			m.selectSource()
-		} else {
+		default:
 			m.rowIndex = max(0, len(m.rows)-1)
 			m.ensureVisible()
 		}
@@ -495,10 +544,16 @@ func (m uiModel) handleMouse(event tea.MouseEvent) (tea.Model, tea.Cmd) {
 			delta = -3
 		}
 		if event.X < leftWidth {
-			m.focus = 0
-			m.moveSource(delta)
+			localY := event.Y - mainTop
+			if localY >= sidebarStateOptionTop && localY < sidebarStateOptionTop+len(m.states) {
+				m.focus = focusState
+				m.moveState(delta)
+			} else {
+				m.focus = focusSource
+				m.moveSource(delta)
+			}
 		} else {
-			m.focus = 1
+			m.focus = focusTable
 			m.moveRow(delta)
 		}
 		return m, nil
@@ -508,9 +563,16 @@ func (m uiModel) handleMouse(event tea.MouseEvent) (tea.Model, tea.Cmd) {
 	}
 	localY := event.Y - mainTop
 	if event.X < leftWidth {
-		index := m.sourceOffset + localY - 1
+		stateIndex := localY - sidebarStateOptionTop
+		if stateIndex >= 0 && stateIndex < len(m.states) {
+			m.focus = focusState
+			m.stateIndex = stateIndex
+			m.selectState()
+			return m, nil
+		}
+		index := m.sourceOffset + localY - sidebarSourceOptionTop
 		if index >= 0 && index < len(m.sources) {
-			m.focus = 0
+			m.focus = focusSource
 			m.sourceIndex = index
 			m.selectSource()
 		}
@@ -518,7 +580,7 @@ func (m uiModel) handleMouse(event tea.MouseEvent) (tea.Model, tea.Cmd) {
 	}
 	index := m.rowOffset + localY - 2
 	if index >= 0 && index < len(m.rows) {
-		m.focus = 1
+		m.focus = focusTable
 		m.rowIndex = index
 		m.ensureVisible()
 	}
@@ -557,16 +619,32 @@ func (m *uiModel) applyLoaded(items []service.SkillStatus, warnings []string) {
 }
 
 func (m *uiModel) rebuild(preferredSkill string) {
-	selectedKey := "all"
-	if m.sourceIndex >= 0 && m.sourceIndex < len(m.sources) {
-		selectedKey = m.sources[m.sourceIndex].Key
+	selectedState := model.InvocationState("")
+	if m.stateIndex >= 0 && m.stateIndex < len(m.states) {
+		selectedState = m.states[m.stateIndex].State
 	}
-	filtered := inventory.Apply(m.items, inventory.Filter{Query: m.search.Value()})
+	selectedSource := inventory.SourceOption{Key: "all", Label: "All"}
+	if m.sourceIndex >= 0 && m.sourceIndex < len(m.sources) {
+		selectedSource = m.sources[m.sourceIndex]
+	}
+	filter := inventory.Filter{
+		Query:     m.search.Value(),
+		State:     selectedState,
+		SourceKey: selectedSource.Key,
+	}
+	filtered := inventory.Apply(m.items, filter)
 	m.groups = inventory.GroupStatuses(filtered)
-	m.sources = inventory.Options(m.groups)
-	m.sourceIndex = optionIndex(m.sources, selectedKey)
+	m.states = inventory.StateOptions(m.items, filter)
+	m.stateIndex = stateOptionIndex(m.states, selectedState)
+	if m.stateIndex < 0 {
+		m.stateIndex = 0
+	}
+	m.sources = inventory.SourceOptions(m.items, filter)
+	m.sourceIndex = optionIndex(m.sources, selectedSource.Key)
 	if m.sourceIndex < 0 {
-		m.sourceIndex = 0
+		selectedSource.Count = 0
+		m.sources = append(m.sources, selectedSource)
+		m.sourceIndex = len(m.sources) - 1
 	}
 	m.rebuildRows(preferredSkill)
 	m.ensureVisible()
@@ -584,7 +662,7 @@ func (m *uiModel) rebuildRows(preferredSkill string) {
 		return
 	}
 	selected := m.sources[min(m.sourceIndex, len(m.sources)-1)]
-	groups := inventory.Select(m.groups, selected)
+	groups := m.groups
 	showHeaders := selected.GroupKey == ""
 	for _, group := range groups {
 		if showHeaders {
@@ -613,8 +691,7 @@ func (m *uiModel) rebuildRows(preferredSkill string) {
 func (m *uiModel) selectSource() {
 	m.rowIndex = 0
 	m.rowOffset = 0
-	m.rebuildRows("")
-	m.ensureVisible()
+	m.rebuild("")
 }
 
 func (m *uiModel) moveSource(delta int) {
@@ -623,6 +700,20 @@ func (m *uiModel) moveSource(delta int) {
 	}
 	m.sourceIndex = clamp(m.sourceIndex+delta, 0, len(m.sources)-1)
 	m.selectSource()
+}
+
+func (m *uiModel) selectState() {
+	m.rowIndex = 0
+	m.rowOffset = 0
+	m.rebuild("")
+}
+
+func (m *uiModel) moveState(delta int) {
+	if len(m.states) == 0 {
+		return
+	}
+	m.stateIndex = clamp(m.stateIndex+delta, 0, len(m.states)-1)
+	m.selectState()
 }
 
 func (m *uiModel) moveRow(delta int) {
@@ -634,7 +725,7 @@ func (m *uiModel) moveRow(delta int) {
 }
 
 func (m *uiModel) ensureVisible() {
-	visibleSources := max(1, m.mainHeight()-1)
+	visibleSources := max(1, m.mainHeight()-sidebarSourceOptionTop)
 	if m.sourceIndex < m.sourceOffset {
 		m.sourceOffset = m.sourceIndex
 	}
@@ -821,6 +912,15 @@ func (m uiModel) openEditorCmd() tea.Cmd {
 func optionIndex(options []inventory.SourceOption, key string) int {
 	for index, option := range options {
 		if option.Key == key {
+			return index
+		}
+	}
+	return -1
+}
+
+func stateOptionIndex(options []inventory.StateOption, state model.InvocationState) int {
+	for index, option := range options {
+		if option.State == state {
 			return index
 		}
 	}

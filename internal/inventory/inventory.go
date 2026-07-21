@@ -45,11 +45,12 @@ type Group struct {
 }
 
 type Filter struct {
-	State  model.InvocationState
-	Drift  bool
-	Scope  model.Scope
-	Source string
-	Query  string
+	State     model.InvocationState
+	Drift     bool
+	Scope     model.Scope
+	Source    string
+	SourceKey string
+	Query     string
 }
 
 type SourceOption struct {
@@ -59,6 +60,12 @@ type SourceOption struct {
 	GroupKey string
 	Depth    int
 	Count    int
+}
+
+type StateOption struct {
+	State model.InvocationState
+	Label string
+	Count int
 }
 
 func Apply(items []service.SkillStatus, filter Filter) []service.SkillStatus {
@@ -78,8 +85,11 @@ func Apply(items []service.SkillStatus, filter Filter) []service.SkillStatus {
 		if source != "" && !strings.Contains(strings.ToLower(item.Source), source) {
 			continue
 		}
+		if !matchesSourceKey(item, filter.SourceKey) {
+			continue
+		}
 		if query != "" {
-			haystack := strings.ToLower(strings.Join([]string{item.Name, item.Description, item.ID, item.Source, item.Path}, "\n"))
+			haystack := strings.ToLower(strings.Join([]string{item.Name, item.Description, item.ID, item.Path}, "\n"))
 			if !strings.Contains(haystack, query) {
 				continue
 			}
@@ -87,6 +97,14 @@ func Apply(items []service.SkillStatus, filter Filter) []service.SkillStatus {
 		result = append(result, item)
 	}
 	return result
+}
+
+func matchesSourceKey(item service.SkillStatus, sourceKey string) bool {
+	if sourceKey == "" || sourceKey == "all" {
+		return true
+	}
+	category, groupKey, _ := location(item)
+	return sourceKey == "category:"+string(category) || sourceKey == "group:"+groupKey
 }
 
 func GroupStatuses(items []service.SkillStatus) []Group {
@@ -155,6 +173,36 @@ func Options(groups []Group) []SourceOption {
 		}
 	}
 	return options
+}
+
+func SourceOptions(items []service.SkillStatus, filter Filter) []SourceOption {
+	options := Options(GroupStatuses(items))
+	filter.Source = ""
+	filter.SourceKey = ""
+	matching := Options(GroupStatuses(Apply(items, filter)))
+	counts := make(map[string]int, len(matching))
+	for _, option := range matching {
+		counts[option.Key] = option.Count
+	}
+	for index := range options {
+		options[index].Count = counts[options[index].Key]
+	}
+	return options
+}
+
+func StateOptions(items []service.SkillStatus, filter Filter) []StateOption {
+	filter.State = ""
+	matching := Apply(items, filter)
+	summary := Summary{}
+	for _, item := range matching {
+		addSummary(&summary, item)
+	}
+	return []StateOption{
+		{Label: "All", Count: summary.Total},
+		{State: model.StateImplicit, Label: "Implicit", Count: summary.Implicit},
+		{State: model.StateManual, Label: "Manual", Count: summary.Manual},
+		{State: model.StateDisabled, Label: "Disabled", Count: summary.Disabled},
+	}
 }
 
 func Select(groups []Group, option SourceOption) []Group {

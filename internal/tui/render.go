@@ -58,11 +58,14 @@ func (m uiModel) View() string {
 func (m uiModel) mainView() string {
 	leftWidth, rightWidth, _, mainHeight := m.layout()
 	lines := []string{m.headerView(), m.searchView()}
+	if m.searching {
+		lines = append(lines, m.searchInputView())
+	}
 	right := m.tableView(rightWidth, mainHeight)
 	if leftWidth == 0 {
 		lines = append(lines, right...)
 	} else {
-		left := m.sourceView(leftWidth, mainHeight)
+		left := m.filterView(leftWidth, mainHeight)
 		for index := 0; index < mainHeight; index++ {
 			lines = append(lines, fitLine(left[index], leftWidth)+mutedStyle.Render(" │ ")+fitLine(right[index], rightWidth))
 		}
@@ -99,25 +102,45 @@ func (m uiModel) headerView() string {
 }
 
 func (m uiModel) searchView() string {
-	if m.searching {
-		input := m.search
-		input.Width = max(10, m.width-4)
-		return fitLine(input.View(), m.width)
+	query := m.search.Value()
+	if query == "" {
+		query = "none"
 	}
-	selected := "All"
-	if m.sourceIndex >= 0 && m.sourceIndex < len(m.sources) {
-		selected = m.sources[m.sourceIndex].Label
-	}
-	query := ""
-	if m.search.Value() != "" {
-		query = "  search: " + m.search.Value()
-	}
-	return fitLine(mutedStyle.Render("Source: ")+selected+query, m.width)
+	line := mutedStyle.Render("Status: ") + m.selectedStateLabel() + mutedStyle.Render(" · Source: ") + m.selectedSourceLabel() + mutedStyle.Render(" · Search: ") + query
+	return fitLine(line, m.width)
 }
 
-func (m uiModel) sourceView(width, height int) []string {
-	lines := []string{headingStyle.Render("SOURCES")}
-	available := max(0, height-1)
+func (m uiModel) searchInputView() string {
+	input := m.search
+	input.Width = max(10, m.width-4)
+	return fitLine(input.View(), m.width)
+}
+
+func (m uiModel) selectedStateLabel() string {
+	if m.stateIndex >= 0 && m.stateIndex < len(m.states) {
+		return m.states[m.stateIndex].Label
+	}
+	return "All"
+}
+
+func (m uiModel) selectedSourceLabel() string {
+	if m.sourceIndex >= 0 && m.sourceIndex < len(m.sources) {
+		return m.sources[m.sourceIndex].Label
+	}
+	return "All"
+}
+
+func (m uiModel) filterView(width, height int) []string {
+	lines := []string{headingStyle.Render("STATUS")}
+	for index, option := range m.states {
+		line := padRight("  "+option.Label, width-5) + fmt.Sprintf("%4d", option.Count)
+		if m.focus == focusState && index == m.stateIndex {
+			line = selectedStyle.Render(fitLine(line, width))
+		}
+		lines = append(lines, line)
+	}
+	lines = append(lines, "", headingStyle.Render("SOURCES"))
+	available := max(0, height-sidebarSourceOptionTop)
 	end := min(len(m.sources), m.sourceOffset+available)
 	for index := m.sourceOffset; index < end; index++ {
 		option := m.sources[index]
@@ -128,7 +151,7 @@ func (m uiModel) sourceView(width, height int) []string {
 		labelWidth := max(3, width-lipgloss.Width(prefix)-6)
 		line := prefix + truncateEnd(option.Label, labelWidth)
 		line = padRight(line, width-5) + fmt.Sprintf("%4d", option.Count)
-		if m.focus == 0 && index == m.sourceIndex {
+		if m.focus == focusSource && index == m.sourceIndex {
 			line = selectedStyle.Render(fitLine(line, width))
 		}
 		lines = append(lines, line)
@@ -140,9 +163,9 @@ func (m uiModel) sourceView(width, height int) []string {
 }
 
 func (m uiModel) tableView(width, height int) []string {
-	label := "All skills"
-	if m.sourceIndex >= 0 && m.sourceIndex < len(m.sources) {
-		label = m.sources[m.sourceIndex].Label
+	label := m.selectedSourceLabel()
+	if state := m.selectedStateLabel(); state != "All" {
+		label = state + " · " + label
 	}
 	lines := []string{headingStyle.Render(fitLine(label, width)), mutedStyle.Render(m.tableHeader(width))}
 	available := max(0, height-2)
@@ -158,12 +181,15 @@ func (m uiModel) tableView(width, height int) []string {
 			line = fmt.Sprintf("%s %s / %s  %s", indicator, inventory.CategoryTitle(row.Group.Category), row.Group.Label, inventory.SummaryLine(row.Group.Summary))
 			line = groupStyle.Render(fitLine(line, width))
 		} else {
-			line = m.skillLine(row.Skill, width, m.focus == 1 && index == m.rowIndex)
+			line = m.skillLine(row.Skill, width, m.focus == focusTable && index == m.rowIndex)
 		}
-		if row.Kind == rowGroup && m.focus == 1 && index == m.rowIndex {
+		if row.Kind == rowGroup && m.focus == focusTable && index == m.rowIndex {
 			line = selectedStyle.Render(fitLine(ansi.Strip(line), width))
 		}
 		lines = append(lines, line)
+	}
+	if len(m.rows) == 0 && len(lines) < height {
+		lines = append(lines, mutedStyle.Render(fitLine("No skills match the current search and filters", width)))
 	}
 	for len(lines) < height {
 		lines = append(lines, "")
@@ -212,7 +238,7 @@ func (m uiModel) footerView() string {
 	}
 	if leftWidth, _, _, _ := m.layout(); leftWidth == 0 {
 		hints = []keyHint{
-			{"←/→", "source"}, {"↑/↓", "move"}, {"Enter", "open"}, {"i/m/d", "stage"},
+			{"[/]", "status"}, {"←/→", "source"}, {"↑/↓", "move"}, {"Enter", "open"},
 			{"a", "apply"}, {"/", "search"}, {"h", "help"}, {"q", "quit"},
 		}
 	}
@@ -244,6 +270,7 @@ func (m uiModel) helpView() string {
 		headingStyle.Render("Navigation"),
 		helpLine("Tab / Shift+Tab", "Switch pane", contentWidth),
 		helpLine("↑ / ↓ or j / k", "Move selection", contentWidth),
+		helpLine("[ / ]", "Change status filter", contentWidth),
 		helpLine("← / →", "Change source", contentWidth),
 		helpLine("PgUp / PgDn", "Move one page", contentWidth),
 		helpLine("Home / End", "Jump to first or last item", contentWidth),
@@ -350,6 +377,9 @@ func (m uiModel) detailView() string {
 
 func (m uiModel) layout() (leftWidth, rightWidth, mainTop, mainHeight int) {
 	mainTop = 2
+	if m.searching {
+		mainTop++
+	}
 	mainHeight = max(3, m.height-mainTop-1)
 	if m.width < 72 {
 		return 0, max(1, m.width), mainTop, mainHeight
