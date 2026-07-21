@@ -46,10 +46,29 @@ type pendingChange struct {
 	Conflict    bool
 }
 
+type skillCondition string
+
+const (
+	conditionSynced   skillCondition = "synced"
+	conditionDrift    skillCondition = "drift"
+	conditionPending  skillCondition = "pending"
+	conditionConflict skillCondition = "conflict"
+	conditionApplied  skillCondition = "applied"
+	conditionReadOnly skillCondition = "read-only"
+)
+
 type skillPresentation struct {
-	Desired model.InvocationState
-	Status  string
-	Marker  string
+	Target    model.InvocationState
+	Condition skillCondition
+	Marker    string
+	ReadOnly  bool
+}
+
+type presentationSummary struct {
+	Drift    int
+	Pending  int
+	Conflict int
+	Applied  int
 }
 
 type uiModel struct {
@@ -73,6 +92,7 @@ type uiModel struct {
 	rowOffset    int
 	collapsed    map[string]bool
 	pending      map[string]pendingChange
+	applied      map[string]bool
 
 	search       textinput.Model
 	searching    bool
@@ -127,6 +147,7 @@ func Run(ctx context.Context, options Options) error {
 		project:   options.Project,
 		collapsed: map[string]bool{},
 		pending:   map[string]pendingChange{},
+		applied:   map[string]bool{},
 		search:    search,
 		spinner:   spin,
 		loading:   true,
@@ -184,8 +205,11 @@ func (m uiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, m.loadCmd()
 		}
-		m.pending = map[string]pendingChange{}
+		conflicts := m.recordApplied()
 		m.status = fmt.Sprintf("Applied %d changes", msg.report.Changed)
+		if conflicts > 0 {
+			m.status += fmt.Sprintf("; %d conflicts remain", conflicts)
+		}
 		return m, m.loadCmd()
 	case fingerprintMsg:
 		commands = append(commands, m.fingerprintCmd())
@@ -482,6 +506,7 @@ func (m *uiModel) applyLoaded(items []service.SkillStatus, warnings []string) {
 			m.pending[id] = change
 		}
 	}
+	m.reconcileApplied(items)
 	m.rebuild("")
 	if len(warnings) > 0 {
 		m.status = fmt.Sprintf("Loaded %d skills with %d warnings", len(items), len(warnings))
@@ -611,6 +636,7 @@ func (m uiModel) stageCurrent(desired model.InvocationState) uiModel {
 		m.status = skill.Name + " is outside the active management scope"
 		return m
 	}
+	delete(m.applied, skill.ID)
 	if desired == skill.Desired {
 		delete(m.pending, skill.ID)
 		m.status = "Pending change removed for " + skill.Name
@@ -627,25 +653,81 @@ func (m uiModel) stageCurrent(desired model.InvocationState) uiModel {
 
 func (m uiModel) presentationFor(skill service.SkillStatus) skillPresentation {
 	presentation := skillPresentation{
-		Desired: skill.Desired,
-		Status:  "synced",
-		Marker:  stateMarker(skill.Actual),
+		Condition: conditionSynced,
+		Marker:    stateMarker(skill.Actual),
+	}
+	if !skill.Managed {
+		presentation.Condition = conditionReadOnly
+		presentation.ReadOnly = true
+		return presentation
 	}
 	if pending, ok := m.pending[skill.ID]; ok {
-		presentation.Desired = pending.Desired
-		presentation.Status = "pending"
+		presentation.Target = pending.Desired
+		presentation.Condition = conditionPending
 		presentation.Marker = "~"
 		if pending.Conflict {
-			presentation.Status = "conflict"
+			presentation.Condition = conditionConflict
 			presentation.Marker = "×"
 		}
 		return presentation
 	}
 	if skill.Actual != skill.Desired {
-		presentation.Status = "drift"
+		presentation.Target = skill.Desired
+		presentation.Condition = conditionDrift
 		presentation.Marker = "!"
+		return presentation
+	}
+	if m.applied[skill.ID] {
+		presentation.Condition = conditionApplied
+		presentation.Marker = "✓"
 	}
 	return presentation
+}
+
+func (m *uiModel) reconcileApplied(items []service.SkillStatus) {
+	current := make(map[string]service.SkillStatus, len(items))
+	for _, item := range items {
+		current[item.ID] = item
+	}
+	for id := range m.applied {
+		item, exists := current[id]
+		if !exists || item.Actual != item.Desired {
+			delete(m.applied, id)
+		}
+	}
+}
+
+func (m *uiModel) recordApplied() int {
+	if m.applied == nil {
+		m.applied = map[string]bool{}
+	}
+	remaining := map[string]pendingChange{}
+	for id, change := range m.pending {
+		if change.Conflict {
+			remaining[id] = change
+			continue
+		}
+		m.applied[id] = true
+	}
+	m.pending = remaining
+	return len(remaining)
+}
+
+func (m uiModel) summarizePresentations() presentationSummary {
+	var summary presentationSummary
+	for _, skill := range m.items {
+		switch m.presentationFor(skill).Condition {
+		case conditionDrift:
+			summary.Drift++
+		case conditionPending:
+			summary.Pending++
+		case conditionConflict:
+			summary.Conflict++
+		case conditionApplied:
+			summary.Applied++
+		}
+	}
+	return summary
 }
 
 func (m uiModel) loadCmd() tea.Cmd {

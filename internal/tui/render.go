@@ -23,11 +23,13 @@ var (
 	helpStyle       = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("39")).Padding(1, 2)
 	groupStyle      = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("75"))
 	warnStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
+	driftStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
+	pendingStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("220"))
 	errorStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
-	implicitStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
-	manualStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("220"))
-	disabledStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
+	successStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
 )
+
+const stateColumnWidth = 23
 
 func (m uiModel) View() string {
 	if m.width <= 0 || m.height <= 0 {
@@ -63,13 +65,21 @@ func (m uiModel) mainView() string {
 
 func (m uiModel) headerView() string {
 	summary := summarizeGroups(m.groups)
-	line := titleStyle.Render("skillctl") + "  " + mutedStyle.Render(inventory.SummaryLine(summary))
+	line := titleStyle.Render("skillctl") + "  " + mutedStyle.Render(fmt.Sprintf("%d skills · implicit %d · manual %d · disabled %d",
+		summary.Total, summary.Implicit, summary.Manual, summary.Disabled))
+	states := m.summarizePresentations()
 	var badges []string
-	if len(m.pending) > 0 {
-		badges = append(badges, warnStyle.Render(fmt.Sprintf("%d pending", len(m.pending))))
+	if states.Drift > 0 {
+		badges = append(badges, driftStyle.Render(fmt.Sprintf("! %d drift", states.Drift)))
 	}
-	if summary.Drift > 0 {
-		badges = append(badges, errorStyle.Render(fmt.Sprintf("%d drift", summary.Drift)))
+	if states.Pending > 0 {
+		badges = append(badges, pendingStyle.Render(fmt.Sprintf("~ %d pending", states.Pending)))
+	}
+	if states.Conflict > 0 {
+		badges = append(badges, errorStyle.Render(fmt.Sprintf("× %d conflict", states.Conflict)))
+	}
+	if states.Applied > 0 {
+		badges = append(badges, successStyle.Render(fmt.Sprintf("✓ %d applied", states.Applied)))
 	}
 	if m.loading || m.applying {
 		badges = append(badges, m.spinner.View()+" working")
@@ -154,8 +164,8 @@ func (m uiModel) tableView(width, height int) []string {
 }
 
 func (m uiModel) tableHeader(width int) string {
-	nameWidth, pathWidth, showPath := tableWidths(width)
-	header := fmt.Sprintf("%-*s %-10s %-10s %-9s %-7s", nameWidth, "NAME", "ACTUAL", "DESIRED", "STATUS", "MANAGED")
+	nameWidth, pathWidth, showPath := m.tableWidths(width)
+	header := padRight("NAME", nameWidth) + " " + padRight("STATE", stateColumnWidth)
 	if showPath {
 		header += " " + padRight("PATH", pathWidth)
 	}
@@ -164,14 +174,10 @@ func (m uiModel) tableHeader(width int) string {
 
 func (m uiModel) skillLine(skill service.SkillStatus, width int) string {
 	presentation := m.presentationFor(skill)
-	managed := "no"
-	if skill.Managed {
-		managed = "yes"
-	}
-	nameWidth, pathWidth, showPath := tableWidths(width)
+	nameWidth, pathWidth, showPath := m.tableWidths(width)
 	nameWidth = max(3, nameWidth)
-	name := renderMarker(presentation.Marker, skill.Actual) + " " + padRight(truncateEnd(skill.Name, nameWidth-2), nameWidth-2)
-	line := fmt.Sprintf("%s %-10s %-10s %-9s %-7s", name, skill.Actual, presentation.Desired, presentation.Status, managed)
+	name := renderMarker(presentation.Marker) + " " + padRight(truncateEnd(skill.Name, nameWidth-2), nameWidth-2)
+	line := name + " " + padRight(renderState(skill.Actual, presentation), stateColumnWidth)
 	if showPath {
 		line += " " + middleTruncate(skill.Path, pathWidth)
 	}
@@ -225,6 +231,11 @@ func (m uiModel) helpView() string {
 		helpLine("PgUp / PgDn", "Move one page", contentWidth),
 		helpLine("Home / End", "Jump to first or last item", contentWidth),
 		"",
+		headingStyle.Render("Status"),
+		helpLine("! / ~", "Drift / pending change", contentWidth),
+		helpLine("× / ✓", "Conflict / applied this session", contentWidth),
+		helpLine("· read-only", "Outside active management scope", contentWidth),
+		"",
 		headingStyle.Render("Actions"),
 		helpLine("Enter", "Open skill or toggle group", contentWidth),
 		helpLine("i / m / d", "Stage implicit, manual, or disabled", contentWidth),
@@ -253,7 +264,7 @@ func (m uiModel) confirmView() string {
 	lines := []string{titleStyle.Render("Apply pending changes?"), ""}
 	for _, id := range m.pendingIDs() {
 		change := m.pending[id]
-		line := fmt.Sprintf("  %s: %s -> %s", id, change.BaseDesired, change.Desired)
+		line := fmt.Sprintf("  %s: %s -> %s", id, change.BaseActual, change.Desired)
 		if change.Conflict {
 			line += "  CONFLICT (will not be applied)"
 		}
@@ -276,16 +287,20 @@ func (m uiModel) detailView() string {
 	lines := []string{
 		titleStyle.Render(skill.Name), "",
 		field("ID", skill.ID),
-		field("Actual", string(skill.Actual)),
-		field("Desired", string(presentation.Desired)),
-		field("Status", presentation.Status),
+		field("Current", string(skill.Actual)),
+	}
+	if presentation.Target != "" {
+		lines = append(lines, field("Target", string(presentation.Target)))
+	}
+	lines = append(lines,
+		field("Condition", string(presentation.Condition)),
 		field("Managed", fmt.Sprintf("%t", skill.Managed)),
 		field("Scope", string(skill.Scope)),
 		field("Source", skill.Source),
 		field("Skill path", skill.Path),
 		field("Policy path", skill.PolicyPath),
 		field("Policy value", policyValue),
-	}
+	)
 	if skill.Journal == nil {
 		lines = append(lines, field("Original state", "not recorded"), field("Last sync", "never"))
 	} else {
@@ -323,13 +338,20 @@ func (m uiModel) visibleRowCount() int {
 	return max(1, m.mainHeight()-2)
 }
 
-func tableWidths(width int) (nameWidth, pathWidth int, showPath bool) {
-	const fixed = 1 + 10 + 1 + 10 + 1 + 9 + 1 + 7
-	if width < 76 {
-		return max(8, width-fixed), 0, false
+func (m uiModel) tableWidths(width int) (nameWidth, pathWidth int, showPath bool) {
+	const fixed = 1 + stateColumnWidth
+	availableNameWidth := max(8, width-fixed)
+	desiredNameWidth := lipgloss.Width("NAME")
+	for _, row := range m.rows {
+		if row.Kind == rowSkill {
+			desiredNameWidth = max(desiredNameWidth, lipgloss.Width(row.Skill.Name)+2)
+		}
 	}
-	nameWidth = clamp(width/4, 14, 30)
-	pathWidth = max(8, width-fixed-nameWidth-1)
+	nameWidth = min(desiredNameWidth, availableNameWidth)
+	pathWidth = width - fixed - nameWidth - 1
+	if pathWidth < 8 {
+		return availableNameWidth, 0, false
+	}
 	return nameWidth, pathWidth, true
 }
 
@@ -344,21 +366,36 @@ func stateMarker(state model.InvocationState) string {
 	}
 }
 
-func renderMarker(marker string, state model.InvocationState) string {
+func renderMarker(marker string) string {
 	switch marker {
-	case "×", "!":
+	case "×":
 		return errorStyle.Render(marker)
+	case "!":
+		return driftStyle.Render(marker)
 	case "~":
-		return warnStyle.Render(marker)
+		return pendingStyle.Render(marker)
+	case "✓":
+		return successStyle.Render(marker)
 	}
-	switch state {
-	case model.StateImplicit:
-		return implicitStyle.Render(marker)
-	case model.StateManual:
-		return manualStyle.Render(marker)
-	default:
-		return disabledStyle.Render(marker)
+	return mutedStyle.Render(marker)
+}
+
+func renderState(current model.InvocationState, presentation skillPresentation) string {
+	state := string(current)
+	if presentation.ReadOnly {
+		return state + mutedStyle.Render(" · read-only")
 	}
+	if presentation.Target == "" {
+		return state
+	}
+	target := string(presentation.Target)
+	switch presentation.Condition {
+	case conditionPending:
+		target = pendingStyle.Render(target)
+	case conditionConflict:
+		target = errorStyle.Render(target)
+	}
+	return state + " → " + target
 }
 
 func summarizeGroups(groups []inventory.Group) inventory.Summary {
