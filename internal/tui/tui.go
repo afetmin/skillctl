@@ -672,7 +672,6 @@ func (m uiModel) presentationFor(skill service.SkillStatus) skillPresentation {
 		return presentation
 	}
 	if skill.Actual != skill.Desired {
-		presentation.Target = skill.Desired
 		presentation.Condition = conditionDrift
 		presentation.Marker = "!"
 		return presentation

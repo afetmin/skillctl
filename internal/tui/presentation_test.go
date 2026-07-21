@@ -37,7 +37,6 @@ func TestPresentationFor(t *testing.T) {
 				Desired: model.StateImplicit,
 				Managed: true,
 			},
-			wantTarget:    model.StateImplicit,
 			wantCondition: conditionDrift,
 			wantMarker:    "!",
 		},

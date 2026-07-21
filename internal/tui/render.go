@@ -24,7 +24,8 @@ var (
 	groupStyle      = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("75"))
 	warnStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
 	driftStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
-	pendingStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("220"))
+	pendingStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("220"))
+	conflictStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("203"))
 	errorStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
 	successStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
 )
@@ -369,7 +370,7 @@ func stateMarker(state model.InvocationState) string {
 func renderMarker(marker string) string {
 	switch marker {
 	case "×":
-		return errorStyle.Render(marker)
+		return conflictStyle.Render(marker)
 	case "!":
 		return driftStyle.Render(marker)
 	case "~":
@@ -393,7 +394,7 @@ func renderState(current model.InvocationState, presentation skillPresentation) 
 	case conditionPending:
 		target = pendingStyle.Render(target)
 	case conditionConflict:
-		target = errorStyle.Render(target)
+		target = conflictStyle.Render(target)
 	}
 	return state + " → " + target
 }
