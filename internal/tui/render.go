@@ -14,20 +14,22 @@ import (
 )
 
 var (
-	titleStyle      = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("39"))
-	mutedStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
-	headingStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("252"))
-	selectedStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("231")).Background(lipgloss.Color("24"))
-	footerKeyStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("228"))
-	footerTextStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
-	helpStyle       = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("39")).Padding(1, 2)
-	groupStyle      = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("75"))
-	warnStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
-	driftStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
-	pendingStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("220"))
-	conflictStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("203"))
-	errorStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
-	successStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
+	titleStyle            = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("39"))
+	mutedStyle            = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
+	headingStyle          = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("252"))
+	selectedStyle         = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("231")).Background(lipgloss.Color("24"))
+	selectedPendingStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("220")).Background(lipgloss.Color("24"))
+	selectedConflictStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("203")).Background(lipgloss.Color("24"))
+	footerKeyStyle        = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("228"))
+	footerTextStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
+	helpStyle             = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("39")).Padding(1, 2)
+	groupStyle            = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("75"))
+	warnStyle             = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
+	driftStyle            = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
+	pendingStyle          = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("220"))
+	conflictStyle         = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("203"))
+	errorStyle            = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
+	successStyle          = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
 )
 
 const stateColumnWidth = 23
@@ -151,9 +153,9 @@ func (m uiModel) tableView(width, height int) []string {
 			line = fmt.Sprintf("%s %s / %s  %s", indicator, inventory.CategoryTitle(row.Group.Category), row.Group.Label, inventory.SummaryLine(row.Group.Summary))
 			line = groupStyle.Render(fitLine(line, width))
 		} else {
-			line = m.skillLine(row.Skill, width)
+			line = m.skillLine(row.Skill, width, m.focus == 1 && index == m.rowIndex)
 		}
-		if m.focus == 1 && index == m.rowIndex {
+		if row.Kind == rowGroup && m.focus == 1 && index == m.rowIndex {
 			line = selectedStyle.Render(fitLine(ansi.Strip(line), width))
 		}
 		lines = append(lines, line)
@@ -173,10 +175,18 @@ func (m uiModel) tableHeader(width int) string {
 	return fitLine(header, width)
 }
 
-func (m uiModel) skillLine(skill service.SkillStatus, width int) string {
+func (m uiModel) skillLine(skill service.SkillStatus, width int, selected bool) string {
 	presentation := m.presentationFor(skill)
 	nameWidth, pathWidth, showPath := m.tableWidths(width)
 	nameWidth = max(3, nameWidth)
+	nameText := presentation.Marker + " " + padRight(truncateEnd(skill.Name, nameWidth-2), nameWidth-2)
+	if selected {
+		line := selectedStyle.Render(nameText) + selectedStyle.Render(" ") + renderSelectedState(skill.Actual, presentation, stateColumnWidth)
+		if showPath {
+			line += selectedStyle.Render(" " + middleTruncate(skill.Path, pathWidth))
+		}
+		return line
+	}
 	name := renderMarker(presentation.Marker) + " " + padRight(truncateEnd(skill.Name, nameWidth-2), nameWidth-2)
 	line := name + " " + padRight(renderState(skill.Actual, presentation), stateColumnWidth)
 	if showPath {
@@ -397,6 +407,24 @@ func renderState(current model.InvocationState, presentation skillPresentation) 
 		target = conflictStyle.Render(target)
 	}
 	return state + " → " + target
+}
+
+func renderSelectedState(current model.InvocationState, presentation skillPresentation, width int) string {
+	state := string(current)
+	if presentation.ReadOnly {
+		return selectedStyle.Render(padRight(state+" · read-only", width))
+	}
+	if presentation.Target == "" {
+		return selectedStyle.Render(padRight(state, width))
+	}
+	prefix := state + " → "
+	target := string(presentation.Target)
+	targetStyle := selectedPendingStyle
+	if presentation.Condition == conditionConflict {
+		targetStyle = selectedConflictStyle
+	}
+	padding := strings.Repeat(" ", max(0, width-lipgloss.Width(prefix)-lipgloss.Width(target)))
+	return selectedStyle.Render(prefix) + targetStyle.Render(target) + selectedStyle.Render(padding)
 }
 
 func summarizeGroups(groups []inventory.Group) inventory.Summary {

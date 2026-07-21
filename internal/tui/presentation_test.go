@@ -186,6 +186,55 @@ func TestStageCurrentClearsAppliedMarker(t *testing.T) {
 	}
 }
 
+func TestStageCurrentCanApplyExistingDriftTarget(t *testing.T) {
+	skill := service.SkillStatus{
+		Skill:   model.Skill{ID: "skill-a", Name: "Skill A"},
+		Actual:  model.StateManual,
+		Desired: model.StateImplicit,
+		Managed: true,
+	}
+	m := uiModel{
+		rows:    []tableRow{{Kind: rowSkill, Skill: skill}},
+		pending: map[string]pendingChange{},
+		applied: map[string]bool{},
+	}
+
+	m = m.stageCurrent(model.StateImplicit)
+
+	change, ok := m.pending["skill-a"]
+	if !ok {
+		t.Fatal("选择现有漂移目标后没有生成待应用修改")
+	}
+	if change.Desired != model.StateImplicit {
+		t.Fatalf("Desired = %q, want %q", change.Desired, model.StateImplicit)
+	}
+	presentation := m.presentationFor(skill)
+	if presentation.Target != model.StateImplicit || presentation.Condition != conditionPending {
+		t.Fatalf("presentation = %#v", presentation)
+	}
+}
+
+func TestStageCurrentCanResolveDriftByKeepingActualState(t *testing.T) {
+	skill := service.SkillStatus{
+		Skill:   model.Skill{ID: "skill-a", Name: "Skill A"},
+		Actual:  model.StateManual,
+		Desired: model.StateImplicit,
+		Managed: true,
+	}
+	m := uiModel{
+		rows:    []tableRow{{Kind: rowSkill, Skill: skill}},
+		pending: map[string]pendingChange{},
+		applied: map[string]bool{},
+	}
+
+	m = m.stageCurrent(model.StateManual)
+
+	change, ok := m.pending["skill-a"]
+	if !ok || change.Desired != model.StateManual {
+		t.Fatalf("保持当前状态时没有生成用于消除漂移的修改: %#v", change)
+	}
+}
+
 func TestSummarizePresentations(t *testing.T) {
 	m := uiModel{
 		items: []service.SkillStatus{

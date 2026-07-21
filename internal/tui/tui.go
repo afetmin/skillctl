@@ -637,7 +637,7 @@ func (m uiModel) stageCurrent(desired model.InvocationState) uiModel {
 		return m
 	}
 	delete(m.applied, skill.ID)
-	if desired == skill.Desired {
+	if skill.Actual == skill.Desired && desired == skill.Actual {
 		delete(m.pending, skill.ID)
 		m.status = "Pending change removed for " + skill.Name
 		return m
