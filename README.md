@@ -107,6 +107,8 @@ skillctl restore --all
 
 TUI 左侧按来源选择范围，右侧显示 Skill 表格；窄终端会自动收起来源栏。
 
+表格中的 `DESIRED` 会立即显示暂存后的目标状态；`STATUS` 使用 `synced`、`drift`、`pending`、`conflict` 区分已同步、存在漂移、已暂存和暂存冲突。
+
 | 按键 | 操作 |
 | --- | --- |
 | `Tab` | 切换来源栏和 Skill 表格 |

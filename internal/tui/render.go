@@ -155,7 +155,7 @@ func (m uiModel) tableView(width, height int) []string {
 
 func (m uiModel) tableHeader(width int) string {
 	nameWidth, pathWidth, showPath := tableWidths(width)
-	header := fmt.Sprintf("%-*s %-10s %-10s %-7s", nameWidth, "NAME", "ACTUAL", "DESIRED", "MANAGED")
+	header := fmt.Sprintf("%-*s %-10s %-10s %-9s %-7s", nameWidth, "NAME", "ACTUAL", "DESIRED", "STATUS", "MANAGED")
 	if showPath {
 		header += " " + padRight("PATH", pathWidth)
 	}
@@ -163,26 +163,15 @@ func (m uiModel) tableHeader(width int) string {
 }
 
 func (m uiModel) skillLine(skill service.SkillStatus, width int) string {
-	desired := skill.Desired
-	marker := stateMarker(skill.Actual)
-	if pending, ok := m.pending[skill.ID]; ok {
-		desired = pending.Desired
-		if pending.Conflict {
-			marker = "×"
-		} else {
-			marker = "~"
-		}
-	} else if skill.Actual != skill.Desired {
-		marker = "!"
-	}
+	presentation := m.presentationFor(skill)
 	managed := "no"
 	if skill.Managed {
 		managed = "yes"
 	}
 	nameWidth, pathWidth, showPath := tableWidths(width)
 	nameWidth = max(3, nameWidth)
-	name := renderMarker(marker, skill.Actual) + " " + padRight(truncateEnd(skill.Name, nameWidth-2), nameWidth-2)
-	line := fmt.Sprintf("%s %-10s %-10s %-7s", name, skill.Actual, desired, managed)
+	name := renderMarker(presentation.Marker, skill.Actual) + " " + padRight(truncateEnd(skill.Name, nameWidth-2), nameWidth-2)
+	line := fmt.Sprintf("%s %-10s %-10s %-9s %-7s", name, skill.Actual, presentation.Desired, presentation.Status, managed)
 	if showPath {
 		line += " " + middleTruncate(skill.Path, pathWidth)
 	}
@@ -279,10 +268,7 @@ func (m uiModel) detailView() string {
 	if !ok {
 		return fitScreen([]string{"No skill selected", "", "Esc back"}, m.width, m.height)
 	}
-	desired := skill.Desired
-	if pending, exists := m.pending[skill.ID]; exists {
-		desired = pending.Desired
-	}
+	presentation := m.presentationFor(skill)
 	policyValue := "not set (implicit allowed)"
 	if skill.Policy != nil {
 		policyValue = fmt.Sprintf("%t", *skill.Policy)
@@ -291,7 +277,8 @@ func (m uiModel) detailView() string {
 		titleStyle.Render(skill.Name), "",
 		field("ID", skill.ID),
 		field("Actual", string(skill.Actual)),
-		field("Desired", string(desired)),
+		field("Desired", string(presentation.Desired)),
+		field("Status", presentation.Status),
 		field("Managed", fmt.Sprintf("%t", skill.Managed)),
 		field("Scope", string(skill.Scope)),
 		field("Source", skill.Source),
@@ -337,8 +324,8 @@ func (m uiModel) visibleRowCount() int {
 }
 
 func tableWidths(width int) (nameWidth, pathWidth int, showPath bool) {
-	const fixed = 1 + 10 + 1 + 10 + 1 + 7
-	if width < 66 {
+	const fixed = 1 + 10 + 1 + 10 + 1 + 9 + 1 + 7
+	if width < 76 {
 		return max(8, width-fixed), 0, false
 	}
 	nameWidth = clamp(width/4, 14, 30)

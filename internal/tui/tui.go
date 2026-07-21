@@ -46,6 +46,12 @@ type pendingChange struct {
 	Conflict    bool
 }
 
+type skillPresentation struct {
+	Desired model.InvocationState
+	Status  string
+	Marker  string
+}
+
 type uiModel struct {
 	ctx     context.Context
 	manager service.Manager
@@ -617,6 +623,29 @@ func (m uiModel) stageCurrent(desired model.InvocationState) uiModel {
 	}
 	m.status = fmt.Sprintf("Staged %s -> %s", skill.Name, desired)
 	return m
+}
+
+func (m uiModel) presentationFor(skill service.SkillStatus) skillPresentation {
+	presentation := skillPresentation{
+		Desired: skill.Desired,
+		Status:  "synced",
+		Marker:  stateMarker(skill.Actual),
+	}
+	if pending, ok := m.pending[skill.ID]; ok {
+		presentation.Desired = pending.Desired
+		presentation.Status = "pending"
+		presentation.Marker = "~"
+		if pending.Conflict {
+			presentation.Status = "conflict"
+			presentation.Marker = "×"
+		}
+		return presentation
+	}
+	if skill.Actual != skill.Desired {
+		presentation.Status = "drift"
+		presentation.Marker = "!"
+	}
+	return presentation
 }
 
 func (m uiModel) loadCmd() tea.Cmd {
