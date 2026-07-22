@@ -267,12 +267,21 @@ func (m uiModel) footerView() string {
 	if skill, ok := m.currentSkill(); ok && deleteBlockedReason(skill) == "" && !m.loading && !m.applying && !m.deleting {
 		deleteHint = footerKeyStyle.Render("x") + " " + footerTextStyle.Render("Delete")
 	}
-	keys := deleteHint
-	if status != "" {
-		keys += "  |  " + status
+	if lipgloss.Width(deleteHint) >= m.width {
+		return truncateEnd(deleteHint, m.width)
 	}
-	keys += "  |  " + renderKeyHints(hints)
-	return fitLine(keys, m.width)
+	leftReserve := 0
+	if status != "" {
+		leftReserve = min(lipgloss.Width(status), m.width/3) + 2
+	}
+	keys := renderKeyHints(hints)
+	available := max(0, m.width-leftReserve-lipgloss.Width(deleteHint)-2)
+	keys = truncateEnd(keys, available)
+	if keys != "" {
+		keys += "  "
+	}
+	keys += deleteHint
+	return alignRight(status, keys, m.width)
 }
 
 type keyHint struct {
@@ -286,6 +295,19 @@ func renderKeyHints(hints []keyHint) string {
 		parts = append(parts, footerKeyStyle.Render(hint.key)+" "+footerTextStyle.Render(hint.label))
 	}
 	return strings.Join(parts, "  ")
+}
+
+func alignRight(left, right string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	rightWidth := lipgloss.Width(right)
+	if rightWidth >= width {
+		return truncateEnd(right, width)
+	}
+	left = truncateEnd(left, max(0, width-rightWidth-2))
+	gap := width - lipgloss.Width(left) - rightWidth
+	return left + strings.Repeat(" ", gap) + right
 }
 
 func (m uiModel) helpView() string {
@@ -327,17 +349,12 @@ func (m uiModel) helpView() string {
 }
 
 func (m uiModel) deleteConfirmView() string {
-	if m.height < 2 {
-		return fitScreen([]string{titleStyle.Render("Delete skill?")}, m.width, m.height)
-	}
+	contentWidth := m.deleteContentWidth()
 	content := m.deleteConfirmLines()
 	visible := m.deleteVisibleCount()
 	start := clamp(m.deleteOffset, 0, max(0, len(content)-visible))
 	end := min(len(content), start+visible)
 	lines := append([]string(nil), content[start:end]...)
-	for len(lines) < visible {
-		lines = append(lines, "")
-	}
 	cancel := "[ Cancel ]"
 	deleteButton := dangerStyle.Render("[ Delete ]")
 	if m.deleteChoice == deleteChoiceCancel {
@@ -345,19 +362,20 @@ func (m uiModel) deleteConfirmView() string {
 	} else {
 		deleteButton = selectedDangerStyle.Render("[ Delete ]")
 	}
-	_, cancelStart, _, _, _ := m.deleteButtonLayout()
+	cancelStart, _, _, _ := deleteButtonRanges(contentWidth)
 	buttons := strings.Repeat(" ", cancelStart) + cancel + "    " + deleteButton
-	lines = append(lines, fitLine(buttons, m.width))
+	lines = append(lines, fitLine(buttons, contentWidth))
 	hint := mutedStyle.Render("↑/↓ scroll · ←/→ or Tab choose · Enter confirm · Esc cancel")
 	if m.deleting {
 		hint = m.spinner.View() + " deleting " + m.deleteSkill.Name
 	}
-	lines = append(lines, fitLine(hint, m.width))
-	return fitScreen(lines, m.width, m.height)
+	lines = append(lines, fitLine(hint, contentWidth))
+	modal := helpStyle.Width(contentWidth).Render(strings.Join(lines, "\n"))
+	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, modal)
 }
 
 func (m uiModel) deleteConfirmLines() []string {
-	contentWidth := max(20, min(76, m.width-4))
+	contentWidth := m.deleteContentWidth()
 	lines := []string{
 		titleStyle.Render("Delete skill?"),
 		"",
@@ -373,8 +391,15 @@ func (m uiModel) deleteConfirmLines() []string {
 	return lines
 }
 
+func (m uiModel) deleteContentWidth() int {
+	frameWidth, _ := helpStyle.GetFrameSize()
+	return max(1, min(76, m.width-frameWidth))
+}
+
 func (m uiModel) deleteVisibleCount() int {
-	return max(1, m.height-2)
+	_, frameHeight := helpStyle.GetFrameSize()
+	available := max(1, m.height-frameHeight-2)
+	return min(len(m.deleteConfirmLines()), available)
 }
 
 func (m uiModel) deleteMaxOffset() int {
@@ -382,11 +407,24 @@ func (m uiModel) deleteMaxOffset() int {
 }
 
 func (m uiModel) deleteButtonLayout() (y, cancelStart, cancelEnd, deleteStart, deleteEnd int) {
+	contentWidth := m.deleteContentWidth()
+	frameWidth, frameHeight := helpStyle.GetFrameSize()
+	modalWidth := contentWidth + frameWidth
+	modalHeight := m.deleteVisibleCount() + 2 + frameHeight
+	originX := max(0, (m.width-modalWidth)/2)
+	originY := max(0, (m.height-modalHeight)/2)
+	contentX := originX + helpStyle.GetBorderLeftSize() + helpStyle.GetPaddingLeft()
+	contentY := originY + helpStyle.GetBorderTopSize() + helpStyle.GetPaddingTop()
+	cancelStart, cancelEnd, deleteStart, deleteEnd = deleteButtonRanges(contentWidth)
+	return contentY + m.deleteVisibleCount(), contentX + cancelStart, contentX + cancelEnd, contentX + deleteStart, contentX + deleteEnd
+}
+
+func deleteButtonRanges(width int) (cancelStart, cancelEnd, deleteStart, deleteEnd int) {
 	cancelWidth := lipgloss.Width("[ Cancel ]")
 	deleteWidth := lipgloss.Width("[ Delete ]")
 	total := cancelWidth + 4 + deleteWidth
-	start := max(0, (m.width-total)/2)
-	return max(0, m.height-2), start, start + cancelWidth, start + cancelWidth + 4, start + total
+	start := max(0, (width-total)/2)
+	return start, start + cancelWidth, start + cancelWidth + 4, start + total
 }
 
 // wrapFullText 强制换行但不截断内容，用于必须完整展示的路径。

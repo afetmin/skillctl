@@ -711,7 +711,8 @@ func (m uiModel) handleMouse(event tea.MouseEvent) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	}
-	if event.Action == tea.MouseActionPress && event.Button == tea.MouseButtonLeft && event.Y == m.height-1 && event.X >= 0 && event.X < deleteFooterWidth {
+	deleteStart := max(0, m.width-deleteFooterWidth)
+	if event.Action == tea.MouseActionPress && event.Button == tea.MouseButtonLeft && event.Y == m.height-1 && event.X >= deleteStart && event.X < m.width {
 		return m.beginDelete()
 	}
 	statusY := m.statusFilterY()
