@@ -31,15 +31,18 @@ const (
 )
 
 type Skill struct {
-	ID          string `json:"id"`
-	Name        string `json:"name"`
-	Description string `json:"description,omitempty"`
-	Path        string `json:"path"`
-	Scope       Scope  `json:"scope"`
-	Source      string `json:"source"`
-	Enabled     bool   `json:"enabled"`
-	Policy      *bool  `json:"allow_implicit_invocation,omitempty"`
-	PolicyPath  string `json:"policy_path"`
+	ID          string   `json:"id"`
+	Name        string   `json:"name"`
+	Description string   `json:"description,omitempty"`
+	Path        string   `json:"path"`
+	Scope       Scope    `json:"scope"`
+	Source      string   `json:"source"`
+	Enabled     bool     `json:"enabled"`
+	Policy      *bool    `json:"allow_implicit_invocation,omitempty"`
+	PolicyPath  string   `json:"policy_path"`
+	ConfigName  string   `json:"-"`
+	PluginID    string   `json:"plugin_id,omitempty"`
+	Aliases     []string `json:"-"`
 }
 
 func (s Skill) ActualState() InvocationState {

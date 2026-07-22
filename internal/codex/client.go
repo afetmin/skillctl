@@ -10,6 +10,8 @@ import (
 	"io"
 	"os/exec"
 	"sync"
+
+	"skillctl/internal/model"
 )
 
 type Client struct {
@@ -151,6 +153,70 @@ type skillMetadata struct {
 	Enabled     bool   `json:"enabled"`
 }
 
+type skillConfigEntry struct {
+	Path    string `json:"path"`
+	Name    string `json:"name"`
+	Enabled bool   `json:"enabled"`
+}
+
+type configReadResponse struct {
+	Config struct {
+		Skills struct {
+			Config []skillConfigEntry `json:"config"`
+		} `json:"skills"`
+	} `json:"config"`
+}
+
+type SkillEnablement struct {
+	Names map[string]bool
+	Paths map[string]bool
+}
+
+type InstalledPlugin struct {
+	ID           string
+	Marketplace  string
+	Name         string
+	Version      string
+	LocalVersion string
+	Installed    bool
+	Enabled      bool
+}
+
+type InstalledPlugins struct {
+	bySource map[string]InstalledPlugin
+}
+
+func NewInstalledPlugins(items ...InstalledPlugin) InstalledPlugins {
+	plugins := InstalledPlugins{bySource: make(map[string]InstalledPlugin, len(items))}
+	for _, item := range items {
+		plugins.bySource[item.Marketplace+":"+item.Name] = item
+	}
+	return plugins
+}
+
+func (p InstalledPlugins) LookupSource(source string) (InstalledPlugin, bool) {
+	plugin, ok := p.bySource[source]
+	return plugin, ok
+}
+
+type installedPluginsResponse struct {
+	Marketplaces []struct {
+		Name    string `json:"name"`
+		Plugins []struct {
+			ID           string `json:"id"`
+			Name         string `json:"name"`
+			Version      string `json:"version"`
+			LocalVersion string `json:"localVersion"`
+			Installed    bool   `json:"installed"`
+			Enabled      bool   `json:"enabled"`
+		} `json:"plugins"`
+	} `json:"marketplaces"`
+	MarketplaceLoadErrors []struct {
+		Path    string `json:"marketplacePath"`
+		Message string `json:"message"`
+	} `json:"marketplaceLoadErrors"`
+}
+
 func (c *Client) ListSkills(cwds []string) ([]skillMetadata, []string, error) {
 	var response listResponse
 	if err := c.Call("skills/list", map[string]any{
@@ -170,10 +236,75 @@ func (c *Client) ListSkills(cwds []string) ([]skillMetadata, []string, error) {
 	return skills, warnings, nil
 }
 
-func (c *Client) SetEnabled(path string, enabled bool) error {
-	return c.Call("skills/config/write", map[string]any{
+func (c *Client) DiscoverSkills(cwd string) ([]model.Skill, []string, error) {
+	return Discover(c, cwd)
+}
+
+func (c *Client) ListInstalledPlugins(cwd string) (InstalledPlugins, []string, error) {
+	var response installedPluginsResponse
+	if err := c.Call("plugin/installed", map[string]any{
+		"cwds": []string{cwd},
+	}, &response); err != nil {
+		return InstalledPlugins{}, nil, err
+	}
+
+	var installed []InstalledPlugin
+	var warnings []string
+	for _, marketplace := range response.Marketplaces {
+		for _, item := range marketplace.Plugins {
+			if item.ID == "" {
+				warnings = append(warnings, fmt.Sprintf("marketplace %s returned a plugin without a canonical ID", marketplace.Name))
+				continue
+			}
+			installed = append(installed, InstalledPlugin{
+				ID:           item.ID,
+				Marketplace:  marketplace.Name,
+				Name:         item.Name,
+				Version:      item.Version,
+				LocalVersion: item.LocalVersion,
+				Installed:    item.Installed,
+				Enabled:      item.Enabled,
+			})
+		}
+	}
+	for _, loadErr := range response.MarketplaceLoadErrors {
+		warnings = append(warnings, fmt.Sprintf("marketplace %s: %s", loadErr.Path, loadErr.Message))
+	}
+	return NewInstalledPlugins(installed...), warnings, nil
+}
+
+func (c *Client) ReadSkillEnablement(cwd string) (SkillEnablement, error) {
+	var response configReadResponse
+	if err := c.Call("config/read", map[string]any{
+		"cwd":           cwd,
+		"includeLayers": false,
+	}, &response); err != nil {
+		return SkillEnablement{}, err
+	}
+	enablement := SkillEnablement{
+		Names: map[string]bool{},
+		Paths: map[string]bool{},
+	}
+	for _, entry := range response.Config.Skills.Config {
+		if entry.Name != "" {
+			enablement.Names[entry.Name] = entry.Enabled
+		}
+		if entry.Path != "" {
+			enablement.Paths[entry.Path] = entry.Enabled
+		}
+	}
+	return enablement, nil
+}
+
+func (c *Client) SetEnabled(path, name string, enabled bool) error {
+	params := map[string]any{
 		"path":    path,
 		"name":    nil,
 		"enabled": enabled,
-	}, &map[string]any{})
+	}
+	if name != "" {
+		params["path"] = nil
+		params["name"] = name
+	}
+	return c.Call("skills/config/write", params, &map[string]any{})
 }

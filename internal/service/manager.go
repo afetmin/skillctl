@@ -21,7 +21,20 @@ type Manager struct {
 	ConfigPath string
 	StatePath  string
 	CWD        string
+
+	openCodex          codexOpener
+	discoverFilesystem filesystemDiscoverer
 }
+
+type codexSession interface {
+	DiscoverSkills(cwd string) ([]model.Skill, []string, error)
+	ListInstalledPlugins(cwd string) (codex.InstalledPlugins, []string, error)
+	SetEnabled(path, name string, enabled bool) error
+	Close() error
+}
+
+type codexOpener func(context.Context, string, string) (codexSession, error)
+type filesystemDiscoverer func(string) ([]model.Skill, []string, error)
 
 type SyncOptions struct {
 	DryRun    bool
@@ -172,7 +185,8 @@ func (m Manager) SetMany(ctx context.Context, changes map[string]model.Invocatio
 	}
 	sort.Slice(resolved, func(i, j int) bool { return resolved[i].ID < resolved[j].ID })
 	for _, skill := range resolved {
-		cfg.SetState(skill.ID, skill.Name, desiredByID[skill.ID])
+		aliases := append([]string{skill.ConfigName}, skill.Aliases...)
+		cfg.SetState(skill.ID, skill.Name, desiredByID[skill.ID], aliases...)
 	}
 	if err := config.Save(m.ConfigPath, cfg); err != nil {
 		return nil, nil, err
@@ -249,6 +263,7 @@ func (m Manager) Sync(ctx context.Context, options SyncOptions) (model.SyncRepor
 			entry = statestore.Entry{
 				SkillID:               skill.ID,
 				SkillPath:             skill.Path,
+				SkillConfigName:       skill.ConfigName,
 				PolicyPath:            skill.PolicyPath,
 				PolicyFileExisted:     snapshot.FileExisted,
 				OriginalPolicyPresent: snapshot.Present,
@@ -265,12 +280,13 @@ func (m Manager) Sync(ctx context.Context, options SyncOptions) (model.SyncRepor
 				continue
 			}
 			entry.ManagedEnabled = true
+			entry.SkillConfigName = skill.ConfigName
 			entry.LastSyncedAt = time.Now()
 			localState.Entries[skill.Path] = entry
 			if err := statestore.Save(m.StatePath, localState); err != nil {
 				return report, err
 			}
-			if err := client.SetEnabled(skill.Path, false); err != nil {
+			if err := client.SetEnabled(skill.Path, skill.ConfigName, false); err != nil {
 				change.Message = err.Error()
 				report.Conflicts++
 				report.Changes = append(report.Changes, change)
@@ -285,12 +301,13 @@ func (m Manager) Sync(ctx context.Context, options SyncOptions) (model.SyncRepor
 					continue
 				}
 				entry.ManagedEnabled = true
+				entry.SkillConfigName = skill.ConfigName
 				entry.LastSyncedAt = time.Now()
 				localState.Entries[skill.Path] = entry
 				if err := statestore.Save(m.StatePath, localState); err != nil {
 					return report, err
 				}
-				if err := client.SetEnabled(skill.Path, true); err != nil {
+				if err := client.SetEnabled(skill.Path, skill.ConfigName, true); err != nil {
 					change.Message = err.Error()
 					report.Conflicts++
 					report.Changes = append(report.Changes, change)
@@ -342,7 +359,7 @@ func (m Manager) Restore(ctx context.Context, selectors []string, all, dryRun bo
 			selected[selector] = true
 		}
 	}
-	var client *codex.Client
+	var client codexSession
 	if !dryRun {
 		needClient := false
 		for _, entry := range localState.Entries {
@@ -357,7 +374,7 @@ func (m Manager) Restore(ctx context.Context, selectors []string, all, dryRun bo
 			if loadErr != nil {
 				return report, loadErr
 			}
-			client, err = codex.Open(ctx, cfg.Adapters.Codex.Command, m.CWD)
+			client, err = m.openCodexSession(ctx, cfg.Adapters.Codex.Command)
 			if err != nil {
 				return report, err
 			}
@@ -384,7 +401,7 @@ func (m Manager) Restore(ctx context.Context, selectors []string, all, dryRun bo
 			continue
 		}
 		if entry.ManagedEnabled {
-			if err := client.SetEnabled(entry.SkillPath, entry.OriginalEnabled); err != nil {
+			if err := client.SetEnabled(entry.SkillPath, entry.SkillConfigName, entry.OriginalEnabled); err != nil {
 				report.Conflicts = append(report.Conflicts, entry.SkillID+": "+err.Error())
 				continue
 			}
@@ -416,41 +433,55 @@ func (m Manager) Restore(ctx context.Context, selectors []string, all, dryRun bo
 	return report, nil
 }
 
-func (m Manager) discover(ctx context.Context, cfg config.Config) ([]model.Skill, []string, *codex.Client, error) {
-	client, err := codex.Open(ctx, cfg.Adapters.Codex.Command, m.CWD)
+func (m Manager) discover(ctx context.Context, cfg config.Config) ([]model.Skill, []string, codexSession, error) {
+	client, err := m.openCodexSession(ctx, cfg.Adapters.Codex.Command)
 	if err == nil {
-		skills, warnings, discoverErr := codex.Discover(client, m.CWD)
-		if discoverErr == nil {
-			filesystemSkills, filesystemWarnings, filesystemErr := codex.DiscoverFilesystem(m.CWD)
-			warnings = append(warnings, filesystemWarnings...)
-			if filesystemErr != nil {
-				warnings = append(warnings, "filesystem inventory: "+filesystemErr.Error())
-			} else {
-				skills = mergeSkills(skills, filesystemSkills)
+		installed, warnings, installedErr := client.ListInstalledPlugins(m.CWD)
+		if installedErr != nil {
+			client.Close()
+			err = fmt.Errorf("Codex installed plugin inventory: %w", installedErr)
+		} else {
+			skills, skillWarnings, discoverErr := client.DiscoverSkills(m.CWD)
+			warnings = append(warnings, skillWarnings...)
+			if discoverErr == nil {
+				filesystemSkills, filesystemWarnings, filesystemErr := m.filesystemSkills()
+				warnings = append(warnings, filesystemWarnings...)
+				if filesystemErr != nil {
+					warnings = append(warnings, "filesystem inventory: "+filesystemErr.Error())
+					filesystemSkills = nil
+				}
+				skills = reconcileInventory(skills, filesystemSkills, installed)
+				return skills, warnings, client, nil
 			}
-			return skills, warnings, client, nil
+			client.Close()
+			err = discoverErr
 		}
-		client.Close()
-		err = discoverErr
 	}
-	skills, warnings, fallbackErr := codex.DiscoverFilesystem(m.CWD)
+	skills, warnings, fallbackErr := m.filesystemSkills()
 	warnings = append(warnings, "Codex app-server unavailable; using filesystem fallback: "+err.Error())
 	if fallbackErr != nil {
 		return nil, warnings, nil, fallbackErr
 	}
-	return skills, warnings, nil, nil
+	return reconcileInventory(nil, skills, codex.InstalledPlugins{}), warnings, nil, nil
 }
 
-func mergeSkills(primary, secondary []model.Skill) []model.Skill {
-	primaryPaths := make(map[string]bool, len(primary))
-	for _, skill := range primary {
-		primaryPaths[skill.Path] = true
+func (m Manager) openCodexSession(ctx context.Context, command string) (codexSession, error) {
+	if m.openCodex != nil {
+		return m.openCodex(ctx, command, m.CWD)
 	}
-	for index := range secondary {
-		if secondary[index].Scope == model.ScopePlugin && !primaryPaths[secondary[index].Path] {
-			secondary[index].Enabled = false
-		}
+	return codex.Open(ctx, command, m.CWD)
+}
+
+func (m Manager) filesystemSkills() ([]model.Skill, []string, error) {
+	if m.discoverFilesystem != nil {
+		return m.discoverFilesystem(m.CWD)
 	}
+	return codex.DiscoverFilesystem(m.CWD)
+}
+
+func reconcileInventory(primary, secondary []model.Skill, installed codex.InstalledPlugins) []model.Skill {
+	primary = eligibleSkills(primary, installed)
+	secondary = eligibleSkills(secondary, codex.InstalledPlugins{})
 	sort.SliceStable(secondary, func(i, j int) bool {
 		return skillModTime(secondary[i]).After(skillModTime(secondary[j]))
 	})
@@ -466,6 +497,23 @@ func mergeSkills(primary, secondary []model.Skill) []model.Skill {
 		result = append(result, skill)
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].ID < result[j].ID })
+	return result
+}
+
+func eligibleSkills(skills []model.Skill, installed codex.InstalledPlugins) []model.Skill {
+	result := make([]model.Skill, 0, len(skills))
+	for _, skill := range skills {
+		if skill.Scope != model.ScopePlugin {
+			result = append(result, skill)
+			continue
+		}
+		plugin, ok := installed.LookupSource(skill.Source)
+		if !ok || !plugin.Installed || !plugin.Enabled {
+			continue
+		}
+		skill.PluginID = plugin.ID
+		result = append(result, skill)
+	}
 	return result
 }
 
@@ -502,7 +550,7 @@ func newResolver(skills []model.Skill) resolver {
 func (r resolver) resolve(selector string) (model.Skill, error) {
 	var matches []model.Skill
 	for _, skill := range r.skills {
-		if skill.ID == selector || skill.Path == selector || skill.Name == selector {
+		if matchesSelector(selector, skill, r.nameCount) {
 			matches = append(matches, skill)
 		}
 	}
@@ -563,7 +611,22 @@ func (r resolver) validateProfile(profile config.Profile) ([]string, error) {
 
 func containsSelector(selectors []string, skill model.Skill, counts map[string]int) bool {
 	for _, selector := range selectors {
-		if selector == skill.ID || (selector == skill.Name && counts[skill.Name] == 1) {
+		if matchesSelector(selector, skill, counts) {
+			return true
+		}
+	}
+	return false
+}
+
+func matchesSelector(selector string, skill model.Skill, counts map[string]int) bool {
+	if selector == skill.ID || selector == skill.Path || selector == skill.ConfigName {
+		return true
+	}
+	if selector == skill.Name && counts[skill.Name] == 1 {
+		return true
+	}
+	for _, alias := range skill.Aliases {
+		if selector == alias {
 			return true
 		}
 	}

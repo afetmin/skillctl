@@ -142,12 +142,15 @@ func (c Config) Active() Profile {
 	return c.Profiles[c.ActiveProfile]
 }
 
-func (c *Config) SetState(id, name string, desired model.InvocationState) {
+func (c *Config) SetState(id, name string, desired model.InvocationState, aliases ...string) {
 	profile := c.Profiles[c.ActiveProfile]
-	profile.Implicit = remove(profile.Implicit, id)
-	profile.Implicit = remove(profile.Implicit, name)
-	profile.Disabled = remove(profile.Disabled, id)
-	profile.Disabled = remove(profile.Disabled, name)
+	for _, selector := range append([]string{id, name}, aliases...) {
+		if selector == "" {
+			continue
+		}
+		profile.Implicit = remove(profile.Implicit, selector)
+		profile.Disabled = remove(profile.Disabled, selector)
+	}
 	switch desired {
 	case model.StateImplicit:
 		profile.Implicit = append(profile.Implicit, id)

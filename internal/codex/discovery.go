@@ -44,9 +44,20 @@ func fromMetadata(item skillMetadata) (model.Skill, error) {
 		return model.Skill{}, err
 	}
 	scope, source := classify(item.Path, item.Scope)
+	name := item.Name
+	configName := ""
+	var aliases []string
+	if scope == model.ScopePlugin {
+		configName = pluginConfigName(item.Name, source)
+		name = strings.TrimPrefix(configName, pluginName(source)+":")
+		legacyID := canonicalID(configName, item.Path, scope, source)
+		if legacyID != canonicalID(name, item.Path, scope, source) {
+			aliases = append(aliases, legacyID)
+		}
+	}
 	return model.Skill{
-		ID:          canonicalID(item.Name, item.Path, scope, source),
-		Name:        item.Name,
+		ID:          canonicalID(name, item.Path, scope, source),
+		Name:        name,
 		Description: item.Description,
 		Path:        item.Path,
 		Scope:       scope,
@@ -54,7 +65,24 @@ func fromMetadata(item skillMetadata) (model.Skill, error) {
 		Enabled:     item.Enabled,
 		Policy:      allow,
 		PolicyPath:  policyPath,
+		ConfigName:  configName,
+		Aliases:     aliases,
 	}, nil
+}
+
+func pluginConfigName(name, source string) string {
+	prefix := pluginName(source) + ":"
+	if strings.HasPrefix(name, prefix) {
+		return name
+	}
+	return prefix + name
+}
+
+func pluginName(source string) string {
+	if _, name, ok := strings.Cut(source, ":"); ok {
+		return name
+	}
+	return source
 }
 
 func DiscoverFilesystem(cwd string) ([]model.Skill, []string, error) {
