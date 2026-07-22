@@ -96,7 +96,6 @@ func DiscoverFilesystem(cwd string) ([]model.Skill, []string, error) {
 	}{
 		{path: filepath.Join(home, ".agents", "skills"), scope: "user"},
 		{path: filepath.Join(home, ".codex", "skills"), scope: "user"},
-		{path: filepath.Join(home, ".codex", "plugins", "cache"), scope: "user"},
 		{path: filepath.Join(cwd, ".agents", "skills"), scope: "repo"},
 	}
 	var skills []model.Skill
@@ -138,6 +137,115 @@ func DiscoverFilesystem(cwd string) ([]model.Skill, []string, error) {
 	}
 	sort.Slice(skills, func(i, j int) bool { return skills[i].ID < skills[j].ID })
 	return skills, warnings, nil
+}
+
+func DiscoverPluginSupplements(installed InstalledPlugins, cacheRoot string) ([]model.Skill, []model.DiscoveryWarning) {
+	var skills []model.Skill
+	var warnings []model.DiscoveryWarning
+	for _, plugin := range installed.Active() {
+		root, ok := pluginPackageRoot(plugin, cacheRoot)
+		if !ok {
+			warnings = append(warnings, model.DiscoveryWarning{
+				Code:     "plugin_package_incomplete",
+				PluginID: plugin.ID,
+				Message:  fmt.Sprintf("active plugin %s has no exact materialized package", plugin.ID),
+			})
+			continue
+		}
+		if _, err := os.Stat(root); err != nil {
+			warnings = append(warnings, model.DiscoveryWarning{
+				Code:     "plugin_package_incomplete",
+				PluginID: plugin.ID,
+				Message:  fmt.Sprintf("active plugin %s exact package is unavailable at %s", plugin.ID, root),
+			})
+			continue
+		}
+		err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				warnings = append(warnings, model.DiscoveryWarning{Code: "plugin_package_scan_failed", PluginID: plugin.ID, Message: walkErr.Error()})
+				return nil
+			}
+			if entry.IsDir() || entry.Name() != "SKILL.md" {
+				return nil
+			}
+			name, description, err := readFrontmatter(path)
+			if err != nil {
+				warnings = append(warnings, model.DiscoveryWarning{Code: "plugin_skill_invalid", PluginID: plugin.ID, Message: fmt.Sprintf("%s: %v", path, err)})
+				return nil
+			}
+			skill, err := fromPluginPackage(plugin, path, name, description)
+			if err != nil {
+				warnings = append(warnings, model.DiscoveryWarning{Code: "plugin_skill_invalid", PluginID: plugin.ID, Message: fmt.Sprintf("%s: %v", path, err)})
+				return nil
+			}
+			skills = append(skills, skill)
+			return nil
+		})
+		if err != nil {
+			warnings = append(warnings, model.DiscoveryWarning{Code: "plugin_package_scan_failed", PluginID: plugin.ID, Message: fmt.Sprintf("scan %s: %v", root, err)})
+		}
+	}
+	sort.Slice(skills, func(i, j int) bool { return skills[i].ID < skills[j].ID })
+	return skills, warnings
+}
+
+func pluginPackageRoot(plugin InstalledPlugin, cacheRoot string) (string, bool) {
+	version := plugin.Version
+	if plugin.LocalVersion != "" {
+		version = plugin.LocalVersion
+	}
+	if version != "" && cacheRoot != "" {
+		root := filepath.Join(cacheRoot, plugin.Marketplace, plugin.Name, version)
+		if plugin.SourceType != "local" {
+			return root, true
+		}
+		if _, err := os.Stat(root); err == nil {
+			return root, true
+		}
+	}
+	if plugin.SourceType == "local" && plugin.SourcePath != "" {
+		return plugin.SourcePath, true
+	}
+	return "", false
+}
+
+func PluginOwnsPath(plugin InstalledPlugin, path, cacheRoot string) bool {
+	root, ok := pluginPackageRoot(plugin, cacheRoot)
+	if !ok {
+		return false
+	}
+	relative, err := filepath.Rel(root, path)
+	return err == nil && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator))
+}
+
+func fromPluginPackage(plugin InstalledPlugin, path, name, description string) (model.Skill, error) {
+	policyPath := filepath.Join(filepath.Dir(path), "agents", "openai.yaml")
+	allow, err := policy.Read(policyPath)
+	if err != nil {
+		return model.Skill{}, err
+	}
+	source := plugin.Marketplace + ":" + plugin.Name
+	configName := pluginConfigName(name, source)
+	name = strings.TrimPrefix(configName, plugin.Name+":")
+	legacyID := canonicalID(configName, path, model.ScopePlugin, source)
+	var aliases []string
+	if legacyID != canonicalID(name, path, model.ScopePlugin, source) {
+		aliases = append(aliases, legacyID)
+	}
+	return model.Skill{
+		ID:          canonicalID(name, path, model.ScopePlugin, source),
+		Name:        name,
+		Description: description,
+		Path:        path,
+		Scope:       model.ScopePlugin,
+		Source:      source,
+		Enabled:     false,
+		Policy:      allow,
+		PolicyPath:  policyPath,
+		ConfigName:  configName,
+		PluginID:    plugin.ID,
+		Aliases:     aliases,
+	}, nil
 }
 
 func classify(path, reported string) (model.Scope, string) {

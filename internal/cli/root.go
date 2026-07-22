@@ -203,7 +203,7 @@ func newListCommand(values *options) *cobra.Command {
 		Short:   "List discovered skills and their policy state",
 		Args:    noArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			items, warnings, err := values.manager().List(cmd.Context(), project)
+			items, discovery, err := values.manager().List(cmd.Context(), project)
 			if err != nil {
 				return err
 			}
@@ -213,10 +213,10 @@ func newListCommand(values *options) *cobra.Command {
 			}
 			groups := inventory.GroupStatuses(inventory.Apply(items, filter))
 			if values.json {
-				return printJSON(map[string]any{"groups": groups, "warnings": warnings})
+				return printJSON(map[string]any{"groups": groups, "warnings": discovery.Warnings, "discovery": discovery})
 			}
 			printGroups(cmd, groups)
-			printWarnings(cmd, warnings)
+			printDiscoveryWarnings(cmd, discovery.Warnings)
 			return nil
 		},
 	}
@@ -235,7 +235,7 @@ func newStatusCommand(values *options) *cobra.Command {
 		Short: "Show one skill's current and desired state",
 		Args:  exactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			items, warnings, err := values.manager().List(cmd.Context(), project)
+			items, discovery, err := values.manager().List(cmd.Context(), project)
 			if err != nil {
 				return err
 			}
@@ -244,14 +244,14 @@ func newStatusCommand(values *options) *cobra.Command {
 				return err
 			}
 			if values.json {
-				return printJSON(map[string]any{"skill": item, "warnings": warnings})
+				return printJSON(map[string]any{"skill": item, "warnings": discovery.Warnings, "discovery": discovery})
 			}
 			fmt.Fprintf(cmd.OutOrStdout(), "ID:      %s\n", item.ID)
 			fmt.Fprintf(cmd.OutOrStdout(), "Actual:  %s\n", item.Actual)
 			fmt.Fprintf(cmd.OutOrStdout(), "Desired: %s\n", item.Desired)
 			fmt.Fprintf(cmd.OutOrStdout(), "Scope:   %s\n", item.Scope)
 			fmt.Fprintf(cmd.OutOrStdout(), "Path:    %s\n", item.Path)
-			printWarnings(cmd, warnings)
+			printDiscoveryWarnings(cmd, discovery.Warnings)
 			return nil
 		},
 	}
@@ -368,6 +368,9 @@ func newDoctorCommand(values *options) *cobra.Command {
 			}
 			if report.Changed > 0 {
 				return &ExitError{Code: 3, Err: fmt.Errorf("policy drift detected for %d skills", report.Changed)}
+			}
+			if len(report.Orphans) > 0 {
+				return &ExitError{Code: 3, Err: fmt.Errorf("orphaned retained state detected for %d records", len(report.Orphans))}
 			}
 			return nil
 		},
@@ -580,13 +583,26 @@ func printSync(cmd *cobra.Command, report model.SyncReport) {
 		}
 		fmt.Fprintln(cmd.OutOrStdout(), line)
 	}
-	printWarnings(cmd, report.Warnings)
+	printDiscoveryWarnings(cmd, report.Discovery.Warnings)
+	for _, orphan := range report.Orphans {
+		fmt.Fprintf(cmd.ErrOrStderr(), "orphan: %s %s\n", orphan.Kind, orphanDisplay(orphan))
+	}
 }
 
-func printWarnings(cmd *cobra.Command, warnings []string) {
+func printDiscoveryWarnings(cmd *cobra.Command, warnings []model.DiscoveryWarning) {
 	for _, warning := range warnings {
-		fmt.Fprintf(cmd.ErrOrStderr(), "warning: %s\n", warning)
+		fmt.Fprintf(cmd.ErrOrStderr(), "warning [%s]: %s\n", warning.Code, warning.Message)
 	}
+}
+
+func orphanDisplay(orphan model.OrphanRecord) string {
+	if orphan.Selector != "" {
+		return orphan.Selector
+	}
+	if orphan.SkillID != "" {
+		return orphan.SkillID
+	}
+	return orphan.SkillPath
 }
 
 func printGroups(cmd *cobra.Command, groups []inventory.Group) {

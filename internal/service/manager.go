@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -24,6 +25,7 @@ type Manager struct {
 
 	openCodex          codexOpener
 	discoverFilesystem filesystemDiscoverer
+	pluginCacheRoot    string
 }
 
 type codexSession interface {
@@ -37,9 +39,21 @@ type codexOpener func(context.Context, string, string) (codexSession, error)
 type filesystemDiscoverer func(string) ([]model.Skill, []string, error)
 
 type SyncOptions struct {
-	DryRun    bool
-	Project   bool
-	Selectors []string
+	DryRun                bool
+	Project               bool
+	Selectors             []string
+	allowPartialNonPlugin bool
+}
+
+type InventoryUnavailableError struct {
+	Status model.DiscoveryStatus
+	Reason string
+}
+
+const pluginDiscoveryUpgradeMessage = "this Codex version does not support plugin/installed; upgrade Codex to manage plugin Skills"
+
+func (e *InventoryUnavailableError) Error() string {
+	return fmt.Sprintf("authoritative plugin inventory is unavailable (%s): %s", e.Status, e.Reason)
 }
 
 type SkillStatus struct {
@@ -75,39 +89,45 @@ func (m Manager) Init(ctx context.Context, force, apply bool) (config.Config, *m
 	return cfg, &report, err
 }
 
-func (m Manager) Discover(ctx context.Context) ([]model.Skill, []string, error) {
+func (m Manager) Discover(ctx context.Context) ([]model.Skill, model.DiscoveryReport, error) {
 	cfg, _, err := config.LoadOrDefault(m.ConfigPath)
 	if err != nil {
-		return nil, nil, err
+		return nil, model.DiscoveryReport{}, err
 	}
-	skills, warnings, client, err := m.discover(ctx, cfg)
+	skills, discovery, client, err := m.discover(ctx, cfg)
 	if client != nil {
 		defer client.Close()
 	}
-	return skills, warnings, err
+	return skills, discovery, err
 }
 
-func (m Manager) List(ctx context.Context, project bool) ([]SkillStatus, []string, error) {
+func (m Manager) List(ctx context.Context, project bool) ([]SkillStatus, model.DiscoveryReport, error) {
 	cfg, err := config.Load(m.ConfigPath)
 	if err != nil {
-		return nil, nil, configHint(m.ConfigPath, err)
+		return nil, model.DiscoveryReport{}, configHint(m.ConfigPath, err)
 	}
-	skills, warnings, client, err := m.discover(ctx, cfg)
+	skills, discovery, client, err := m.discover(ctx, cfg)
 	if client != nil {
 		defer client.Close()
 	}
 	if err != nil {
-		return nil, warnings, err
+		return nil, discovery, err
 	}
 	resolver := newResolver(skills)
 	profileWarnings, profileErr := resolver.validateProfile(cfg.Active())
-	warnings = append(warnings, profileWarnings...)
+	warningCode := "orphaned_policy"
+	if !discovery.Complete() {
+		warningCode = "policy_unresolved"
+	}
+	for _, warning := range profileWarnings {
+		discovery.Warnings = append(discovery.Warnings, model.DiscoveryWarning{Code: warningCode, Message: warning})
+	}
 	if profileErr != nil {
-		return nil, warnings, profileErr
+		return nil, discovery, profileErr
 	}
 	localState, err := statestore.LoadOrDefault(m.StatePath)
 	if err != nil {
-		return nil, warnings, err
+		return nil, discovery, err
 	}
 	var result []SkillStatus
 	for _, skill := range skills {
@@ -129,7 +149,7 @@ func (m Manager) List(ctx context.Context, project bool) ([]SkillStatus, []strin
 		}
 		result = append(result, status)
 	}
-	return result, warnings, nil
+	return result, discovery, nil
 }
 
 func (m Manager) Resolve(ctx context.Context, selector string) (model.Skill, error) {
@@ -198,7 +218,7 @@ func (m Manager) SetMany(ctx context.Context, changes map[string]model.Invocatio
 	for _, skill := range resolved {
 		selectors = append(selectors, skill.ID)
 	}
-	report, err := m.Sync(ctx, SyncOptions{Project: project, Selectors: selectors})
+	report, err := m.Sync(ctx, SyncOptions{Project: project, Selectors: selectors, allowPartialNonPlugin: true})
 	return resolved, &report, err
 }
 
@@ -212,18 +232,33 @@ func (m Manager) Sync(ctx context.Context, options SyncOptions) (model.SyncRepor
 	if err != nil {
 		return report, err
 	}
-	skills, warnings, client, err := m.discover(ctx, cfg)
+	skills, discovery, client, err := m.discover(ctx, cfg)
 	if client != nil {
 		defer client.Close()
 	}
-	report.Warnings = append(report.Warnings, warnings...)
+	report.Discovery = discovery
+	report.Warnings = append(report.Warnings, discovery.Warnings...)
 	if err != nil {
 		return report, err
 	}
+	if !discovery.Complete() && !partialSyncAllowed(options, skills) {
+		return report, inventoryUnavailable(discovery)
+	}
 	report.Scanned = len(skills)
 	resolver := newResolver(skills)
+	if discovery.Complete() {
+		report.Orphans = orphanRecords(cfg.Active(), localState, resolver)
+	}
 	profileWarnings, profileErr := resolver.validateProfile(cfg.Active())
-	report.Warnings = append(report.Warnings, profileWarnings...)
+	warningCode := "orphaned_policy"
+	if !discovery.Complete() {
+		warningCode = "policy_unresolved"
+	}
+	for _, warning := range profileWarnings {
+		item := model.DiscoveryWarning{Code: warningCode, Message: warning}
+		report.Discovery.Warnings = append(report.Discovery.Warnings, item)
+		report.Warnings = append(report.Warnings, item)
+	}
 	if profileErr != nil {
 		return report, profileErr
 	}
@@ -264,6 +299,7 @@ func (m Manager) Sync(ctx context.Context, options SyncOptions) (model.SyncRepor
 				SkillID:               skill.ID,
 				SkillPath:             skill.Path,
 				SkillConfigName:       skill.ConfigName,
+				PluginID:              skill.PluginID,
 				PolicyPath:            skill.PolicyPath,
 				PolicyFileExisted:     snapshot.FileExisted,
 				OriginalPolicyPresent: snapshot.Present,
@@ -360,30 +396,58 @@ func (m Manager) Restore(ctx context.Context, selectors []string, all, dryRun bo
 		}
 	}
 	var client codexSession
-	if !dryRun {
-		needClient := false
-		for _, entry := range localState.Entries {
-			matches := all || selected[entry.SkillID] || selected[entry.SkillPath]
-			if matches && entry.ManagedEnabled {
-				needClient = true
-				break
-			}
+	needClient := false
+	needPluginVerification := false
+	for _, entry := range localState.Entries {
+		matches := all || selected[entry.SkillID] || selected[entry.SkillPath]
+		if !matches {
+			continue
 		}
-		if needClient {
-			cfg, _, loadErr := config.LoadOrDefault(m.ConfigPath)
-			if loadErr != nil {
-				return report, loadErr
+		needClient = needClient || (!dryRun && entry.ManagedEnabled)
+		needPluginVerification = needPluginVerification || stateEntryIsPlugin(entry)
+	}
+	var installed codex.InstalledPlugins
+	if needClient || needPluginVerification {
+		cfg, _, loadErr := config.LoadOrDefault(m.ConfigPath)
+		if loadErr != nil {
+			return report, loadErr
+		}
+		client, err = m.openCodexSession(ctx, cfg.Adapters.Codex.Command)
+		if err != nil {
+			if needPluginVerification {
+				return report, &InventoryUnavailableError{Status: model.DiscoveryPartialFailure, Reason: err.Error()}
 			}
-			client, err = m.openCodexSession(ctx, cfg.Adapters.Codex.Command)
+			return report, err
+		}
+		defer client.Close()
+		if needPluginVerification {
+			installed, _, err = client.ListInstalledPlugins(m.CWD)
 			if err != nil {
-				return report, err
+				status := model.DiscoveryPartialFailure
+				reason := err.Error()
+				if codex.IsMethodNotFound(err) {
+					status = model.DiscoveryPartialUnsupported
+					reason = pluginDiscoveryUpgradeMessage
+				}
+				return report, &InventoryUnavailableError{Status: status, Reason: reason}
 			}
-			defer client.Close()
 		}
 	}
 	for key, entry := range localState.Entries {
 		if !all && !selected[entry.SkillID] && !selected[entry.SkillPath] {
 			continue
+		}
+		if stateEntryIsPlugin(entry) {
+			pluginID := stateEntryPluginID(entry)
+			plugin, ok := installed.LookupID(pluginID)
+			if !ok || !plugin.Installed || !plugin.Enabled {
+				report.Conflicts = append(report.Conflicts, entry.SkillID+": plugin installation is not active and verified")
+				continue
+			}
+			if !codex.PluginOwnsPath(plugin, entry.SkillPath, m.codexPluginCacheRoot()) {
+				report.Conflicts = append(report.Conflicts, entry.SkillID+": restore snapshot does not belong to the active plugin package")
+				continue
+			}
 		}
 		if entry.ManagedPolicy && entry.LastManagedHash != "" {
 			currentHash, hashErr := fileutil.HashFile(entry.PolicyPath)
@@ -433,36 +497,72 @@ func (m Manager) Restore(ctx context.Context, selectors []string, all, dryRun bo
 	return report, nil
 }
 
-func (m Manager) discover(ctx context.Context, cfg config.Config) ([]model.Skill, []string, codexSession, error) {
-	client, err := m.openCodexSession(ctx, cfg.Adapters.Codex.Command)
-	if err == nil {
-		installed, warnings, installedErr := client.ListInstalledPlugins(m.CWD)
-		if installedErr != nil {
-			client.Close()
-			err = fmt.Errorf("Codex installed plugin inventory: %w", installedErr)
+func (m Manager) discover(ctx context.Context, cfg config.Config) ([]model.Skill, model.DiscoveryReport, codexSession, error) {
+	report := model.DiscoveryReport{Status: model.DiscoveryComplete}
+	client, openErr := m.openCodexSession(ctx, cfg.Adapters.Codex.Command)
+	if openErr != nil {
+		report.Status = model.DiscoveryPartialFailure
+		report.Warnings = append(report.Warnings, model.DiscoveryWarning{
+			Code:    "plugin_discovery_failed",
+			Message: "Codex app-server unavailable; plugin inventory omitted: " + openErr.Error(),
+		})
+		skills, err := m.partialFilesystemInventory(&report)
+		return skills, report, nil, err
+	}
+
+	installed, installedWarnings, installedErr := client.ListInstalledPlugins(m.CWD)
+	appendStringWarnings(&report, "plugin_marketplace_warning", installedWarnings)
+	if installedErr != nil {
+		if codex.IsMethodNotFound(installedErr) {
+			report.Status = model.DiscoveryPartialUnsupported
+			report.Warnings = append(report.Warnings, model.DiscoveryWarning{
+				Code:    "plugin_discovery_unsupported",
+				Message: pluginDiscoveryUpgradeMessage,
+			})
 		} else {
-			skills, skillWarnings, discoverErr := client.DiscoverSkills(m.CWD)
-			warnings = append(warnings, skillWarnings...)
-			if discoverErr == nil {
-				filesystemSkills, filesystemWarnings, filesystemErr := m.filesystemSkills()
-				warnings = append(warnings, filesystemWarnings...)
-				if filesystemErr != nil {
-					warnings = append(warnings, "filesystem inventory: "+filesystemErr.Error())
-					filesystemSkills = nil
-				}
-				skills = reconcileInventory(skills, filesystemSkills, installed)
-				return skills, warnings, client, nil
-			}
-			client.Close()
-			err = discoverErr
+			report.Status = model.DiscoveryPartialFailure
+			report.Warnings = append(report.Warnings, model.DiscoveryWarning{
+				Code:    "plugin_discovery_failed",
+				Message: "Codex installed-plugin discovery failed; plugin inventory omitted: " + installedErr.Error(),
+			})
 		}
+		appSkills, skillWarnings, skillsErr := client.DiscoverSkills(m.CWD)
+		appendStringWarnings(&report, "skill_discovery_warning", skillWarnings)
+		if skillsErr != nil {
+			report.Warnings = append(report.Warnings, model.DiscoveryWarning{Code: "skill_discovery_failed", Message: skillsErr.Error()})
+			appSkills = nil
+		}
+		filesystemSkills, filesystemErr := m.partialFilesystemInventory(&report)
+		if filesystemErr != nil {
+			client.Close()
+			return nil, report, nil, filesystemErr
+		}
+		return mergeNonPluginSkills(appSkills, filesystemSkills), report, client, nil
 	}
-	skills, warnings, fallbackErr := m.filesystemSkills()
-	warnings = append(warnings, "Codex app-server unavailable; using filesystem fallback: "+err.Error())
-	if fallbackErr != nil {
-		return nil, warnings, nil, fallbackErr
+
+	appSkills, skillWarnings, skillsErr := client.DiscoverSkills(m.CWD)
+	appendStringWarnings(&report, "skill_discovery_warning", skillWarnings)
+	if skillsErr != nil {
+		report.Status = model.DiscoveryPartialFailure
+		report.Warnings = append(report.Warnings, model.DiscoveryWarning{Code: "skill_discovery_failed", Message: skillsErr.Error()})
+		filesystemSkills, filesystemErr := m.partialFilesystemInventory(&report)
+		if filesystemErr != nil {
+			client.Close()
+			return nil, report, nil, filesystemErr
+		}
+		return filesystemSkills, report, client, nil
 	}
-	return reconcileInventory(nil, skills, codex.InstalledPlugins{}), warnings, nil, nil
+
+	filesystemSkills, filesystemWarnings, filesystemErr := m.filesystemSkills()
+	appendStringWarnings(&report, "filesystem_warning", filesystemWarnings)
+	if filesystemErr != nil {
+		report.Warnings = append(report.Warnings, model.DiscoveryWarning{Code: "filesystem_discovery_failed", Message: filesystemErr.Error()})
+		filesystemSkills = nil
+	}
+	supplements, supplementWarnings := codex.DiscoverPluginSupplements(installed, m.codexPluginCacheRoot())
+	report.Warnings = append(report.Warnings, supplementWarnings...)
+	skills := reconcileInventory(appSkills, filesystemSkills, supplements, installed, m.codexPluginCacheRoot())
+	return skills, report, client, nil
 }
 
 func (m Manager) openCodexSession(ctx context.Context, command string) (codexSession, error) {
@@ -479,16 +579,33 @@ func (m Manager) filesystemSkills() ([]model.Skill, []string, error) {
 	return codex.DiscoverFilesystem(m.CWD)
 }
 
-func reconcileInventory(primary, secondary []model.Skill, installed codex.InstalledPlugins) []model.Skill {
-	primary = eligibleSkills(primary, installed)
-	secondary = eligibleSkills(secondary, codex.InstalledPlugins{})
-	sort.SliceStable(secondary, func(i, j int) bool {
-		return skillModTime(secondary[i]).After(skillModTime(secondary[j]))
-	})
+func (m Manager) codexPluginCacheRoot() string {
+	if m.pluginCacheRoot != "" {
+		return m.pluginCacheRoot
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".codex", "plugins", "cache")
+}
+
+func (m Manager) partialFilesystemInventory(report *model.DiscoveryReport) ([]model.Skill, error) {
+	skills, warnings, err := m.filesystemSkills()
+	appendStringWarnings(report, "filesystem_warning", warnings)
+	if err != nil {
+		return nil, err
+	}
+	return nonPluginSkills(skills), nil
+}
+
+func reconcileInventory(primary, filesystem, supplements []model.Skill, installed codex.InstalledPlugins, cacheRoot string) []model.Skill {
+	primary = eligibleSkills(primary, installed, cacheRoot)
+	filesystem = nonPluginSkills(filesystem)
 	seenPath := map[string]bool{}
 	seenID := map[string]bool{}
-	result := make([]model.Skill, 0, len(primary)+len(secondary))
-	for _, skill := range append(primary, secondary...) {
+	result := make([]model.Skill, 0, len(primary)+len(filesystem)+len(supplements))
+	for _, skill := range append(append(primary, supplements...), filesystem...) {
 		if seenPath[skill.Path] || seenID[skill.ID] {
 			continue
 		}
@@ -500,7 +617,7 @@ func reconcileInventory(primary, secondary []model.Skill, installed codex.Instal
 	return result
 }
 
-func eligibleSkills(skills []model.Skill, installed codex.InstalledPlugins) []model.Skill {
+func eligibleSkills(skills []model.Skill, installed codex.InstalledPlugins, cacheRoot string) []model.Skill {
 	result := make([]model.Skill, 0, len(skills))
 	for _, skill := range skills {
 		if skill.Scope != model.ScopePlugin {
@@ -511,18 +628,33 @@ func eligibleSkills(skills []model.Skill, installed codex.InstalledPlugins) []mo
 		if !ok || !plugin.Installed || !plugin.Enabled {
 			continue
 		}
+		if !codex.PluginOwnsPath(plugin, skill.Path, cacheRoot) {
+			continue
+		}
 		skill.PluginID = plugin.ID
 		result = append(result, skill)
 	}
 	return result
 }
 
-func skillModTime(skill model.Skill) time.Time {
-	info, err := os.Stat(skill.Path)
-	if err != nil {
-		return time.Time{}
+func nonPluginSkills(skills []model.Skill) []model.Skill {
+	result := make([]model.Skill, 0, len(skills))
+	for _, skill := range skills {
+		if skill.Scope != model.ScopePlugin {
+			result = append(result, skill)
+		}
 	}
-	return info.ModTime()
+	return result
+}
+
+func mergeNonPluginSkills(primary, secondary []model.Skill) []model.Skill {
+	return reconcileInventory(nonPluginSkills(primary), secondary, nil, codex.InstalledPlugins{}, "")
+}
+
+func appendStringWarnings(report *model.DiscoveryReport, code string, warnings []string) {
+	for _, warning := range warnings {
+		report.Warnings = append(report.Warnings, model.DiscoveryWarning{Code: code, Message: warning})
+	}
 }
 
 type resolver struct {
@@ -545,6 +677,43 @@ func newResolver(skills []model.Skill) resolver {
 		counts[skill.Name]++
 	}
 	return resolver{skills: skills, nameCount: counts}
+}
+
+func orphanRecords(profile config.Profile, localState statestore.State, resolver resolver) []model.OrphanRecord {
+	var result []model.OrphanRecord
+	policyGroups := []struct {
+		selectors []string
+		desired   model.InvocationState
+	}{
+		{selectors: profile.Implicit, desired: model.StateImplicit},
+		{selectors: profile.Disabled, desired: model.StateDisabled},
+	}
+	for _, group := range policyGroups {
+		for _, selector := range group.selectors {
+			if _, err := resolver.resolve(selector); err != nil {
+				var ambiguous ambiguousSelectorError
+				if errors.As(err, &ambiguous) {
+					continue
+				}
+				result = append(result, model.OrphanRecord{Kind: "policy", Selector: selector, Desired: group.desired})
+			}
+		}
+	}
+	for _, entry := range localState.Entries {
+		if _, err := resolver.resolve(entry.SkillID); err == nil {
+			continue
+		}
+		if _, err := resolver.resolve(entry.SkillPath); err == nil {
+			continue
+		}
+		result = append(result, model.OrphanRecord{Kind: "restore", SkillID: entry.SkillID, SkillPath: entry.SkillPath})
+	}
+	sort.Slice(result, func(i, j int) bool {
+		left := result[i].Kind + ":" + result[i].Selector + ":" + result[i].SkillID
+		right := result[j].Kind + ":" + result[j].Selector + ":" + result[j].SkillID
+		return left < right
+	})
+	return result
 }
 
 func (r resolver) resolve(selector string) (model.Skill, error) {
@@ -639,6 +808,47 @@ func selectionSet(selectors []string) map[string]bool {
 		result[selector] = true
 	}
 	return result
+}
+
+func partialSyncAllowed(options SyncOptions, skills []model.Skill) bool {
+	if !options.allowPartialNonPlugin || len(options.Selectors) == 0 {
+		return false
+	}
+	selected := selectionSet(options.Selectors)
+	found := map[string]bool{}
+	for _, skill := range skills {
+		if !selected[skill.ID] {
+			continue
+		}
+		if skill.Scope == model.ScopePlugin {
+			return false
+		}
+		found[skill.ID] = true
+	}
+	return len(found) == len(selected)
+}
+
+func inventoryUnavailable(discovery model.DiscoveryReport) error {
+	reason := "plugin installation state could not be verified"
+	if len(discovery.Warnings) > 0 {
+		reason = discovery.Warnings[0].Message
+	}
+	return &InventoryUnavailableError{Status: discovery.Status, Reason: reason}
+}
+
+func stateEntryIsPlugin(entry statestore.Entry) bool {
+	return entry.PluginID != "" || strings.HasPrefix(entry.SkillID, "codex:plugin:")
+}
+
+func stateEntryPluginID(entry statestore.Entry) string {
+	if entry.PluginID != "" {
+		return entry.PluginID
+	}
+	parts := strings.Split(entry.SkillID, ":")
+	if len(parts) >= 5 && parts[0] == "codex" && parts[1] == "plugin" {
+		return parts[3] + "@" + parts[2]
+	}
+	return ""
 }
 
 func configHint(path string, err error) error {

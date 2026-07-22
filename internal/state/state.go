@@ -22,6 +22,7 @@ type Entry struct {
 	SkillID               string    `json:"skill_id"`
 	SkillPath             string    `json:"skill_path"`
 	SkillConfigName       string    `json:"skill_config_name,omitempty"`
+	PluginID              string    `json:"plugin_id,omitempty"`
 	PolicyPath            string    `json:"policy_path"`
 	ManagedPolicy         bool      `json:"managed_policy"`
 	ManagedEnabled        bool      `json:"managed_enabled"`

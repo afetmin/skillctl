@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"os/exec"
+	"sort"
 	"sync"
 
 	"skillctl/internal/model"
@@ -36,6 +37,21 @@ type rpcError struct {
 	Code    int             `json:"code"`
 	Message string          `json:"message"`
 	Data    json.RawMessage `json:"data,omitempty"`
+}
+
+type RPCError struct {
+	Method  string
+	Code    int
+	Message string
+}
+
+func (e *RPCError) Error() string {
+	return fmt.Sprintf("%s failed (%d): %s", e.Method, e.Code, e.Message)
+}
+
+func IsMethodNotFound(err error) bool {
+	var rpcErr *RPCError
+	return errors.As(err, &rpcErr) && rpcErr.Code == -32601
 }
 
 func Open(ctx context.Context, command, cwd string) (*Client, error) {
@@ -107,7 +123,7 @@ func (c *Client) Call(method string, params, result any) error {
 			continue
 		}
 		if response.Error != nil {
-			return fmt.Errorf("%s failed (%d): %s", method, response.Error.Code, response.Error.Message)
+			return &RPCError{Method: method, Code: response.Error.Code, Message: response.Error.Message}
 		}
 		if result == nil || len(response.Result) == 0 {
 			return nil
@@ -141,7 +157,10 @@ type listResponse struct {
 	Data []struct {
 		CWD    string          `json:"cwd"`
 		Skills []skillMetadata `json:"skills"`
-		Errors []string        `json:"errors"`
+		Errors []struct {
+			Path    string `json:"path"`
+			Message string `json:"message"`
+		} `json:"errors"`
 	} `json:"data"`
 }
 
@@ -180,16 +199,23 @@ type InstalledPlugin struct {
 	LocalVersion string
 	Installed    bool
 	Enabled      bool
+	SourceType   string
+	SourcePath   string
 }
 
 type InstalledPlugins struct {
 	bySource map[string]InstalledPlugin
+	byID     map[string]InstalledPlugin
 }
 
 func NewInstalledPlugins(items ...InstalledPlugin) InstalledPlugins {
-	plugins := InstalledPlugins{bySource: make(map[string]InstalledPlugin, len(items))}
+	plugins := InstalledPlugins{
+		bySource: make(map[string]InstalledPlugin, len(items)),
+		byID:     make(map[string]InstalledPlugin, len(items)),
+	}
 	for _, item := range items {
 		plugins.bySource[item.Marketplace+":"+item.Name] = item
+		plugins.byID[item.ID] = item
 	}
 	return plugins
 }
@@ -197,6 +223,22 @@ func NewInstalledPlugins(items ...InstalledPlugin) InstalledPlugins {
 func (p InstalledPlugins) LookupSource(source string) (InstalledPlugin, bool) {
 	plugin, ok := p.bySource[source]
 	return plugin, ok
+}
+
+func (p InstalledPlugins) LookupID(id string) (InstalledPlugin, bool) {
+	plugin, ok := p.byID[id]
+	return plugin, ok
+}
+
+func (p InstalledPlugins) Active() []InstalledPlugin {
+	result := make([]InstalledPlugin, 0, len(p.byID))
+	for _, plugin := range p.byID {
+		if plugin.Installed && plugin.Enabled {
+			result = append(result, plugin)
+		}
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].ID < result[j].ID })
+	return result
 }
 
 type installedPluginsResponse struct {
@@ -209,6 +251,10 @@ type installedPluginsResponse struct {
 			LocalVersion string `json:"localVersion"`
 			Installed    bool   `json:"installed"`
 			Enabled      bool   `json:"enabled"`
+			Source       struct {
+				Type string `json:"type"`
+				Path string `json:"path"`
+			} `json:"source"`
 		} `json:"plugins"`
 	} `json:"marketplaces"`
 	MarketplaceLoadErrors []struct {
@@ -230,7 +276,7 @@ func (c *Client) ListSkills(cwds []string) ([]skillMetadata, []string, error) {
 	for _, entry := range response.Data {
 		skills = append(skills, entry.Skills...)
 		for _, item := range entry.Errors {
-			warnings = append(warnings, entry.CWD+": "+item)
+			warnings = append(warnings, fmt.Sprintf("%s: %s: %s", entry.CWD, item.Path, item.Message))
 		}
 	}
 	return skills, warnings, nil
@@ -264,6 +310,8 @@ func (c *Client) ListInstalledPlugins(cwd string) (InstalledPlugins, []string, e
 				LocalVersion: item.LocalVersion,
 				Installed:    item.Installed,
 				Enabled:      item.Enabled,
+				SourceType:   item.Source.Type,
+				SourcePath:   item.Source.Path,
 			})
 		}
 	}

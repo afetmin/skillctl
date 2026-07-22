@@ -95,12 +95,12 @@ type uiModel struct {
 	height int
 	focus  int
 
-	items    []service.SkillStatus
-	warnings []string
-	groups   []inventory.Group
-	states   []inventory.StateOption
-	sources  []inventory.SourceOption
-	rows     []tableRow
+	items     []service.SkillStatus
+	discovery model.DiscoveryReport
+	groups    []inventory.Group
+	states    []inventory.StateOption
+	sources   []inventory.SourceOption
+	rows      []tableRow
 
 	stateIndex   int
 	sourceIndex  int
@@ -137,9 +137,9 @@ type uiModel struct {
 }
 
 type loadedMsg struct {
-	items    []service.SkillStatus
-	warnings []string
-	err      error
+	items     []service.SkillStatus
+	discovery model.DiscoveryReport
+	err       error
 }
 
 type appliedMsg struct {
@@ -176,6 +176,7 @@ func Run(ctx context.Context, options Options) error {
 		ctx:       ctx,
 		manager:   options.Manager,
 		project:   options.Project,
+		discovery: model.DiscoveryReport{Status: model.DiscoveryComplete},
 		states:    inventory.StateOptions(nil, inventory.Filter{}),
 		sources:   inventory.SourceOptions(nil, inventory.Filter{}),
 		collapsed: map[string]bool{},
@@ -229,7 +230,7 @@ func (m uiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.err = nil
-		m.applyLoaded(msg.items, msg.warnings)
+		m.applyLoaded(msg.items, msg.discovery)
 		return m, nil
 	case appliedMsg:
 		m.applying = false
@@ -818,13 +819,13 @@ func (m uiModel) stateIndexAtX(x int) int {
 	return -1
 }
 
-func (m *uiModel) applyLoaded(items []service.SkillStatus, warnings []string) {
+func (m *uiModel) applyLoaded(items []service.SkillStatus, discovery model.DiscoveryReport) {
 	previous := map[string]service.SkillStatus{}
 	for _, item := range m.items {
 		previous[item.ID] = item
 	}
 	m.items = items
-	m.warnings = warnings
+	m.discovery = discovery
 	current := map[string]service.SkillStatus{}
 	for _, item := range items {
 		current[item.ID] = item
@@ -844,8 +845,10 @@ func (m *uiModel) applyLoaded(items []service.SkillStatus, warnings []string) {
 	preferredSkill := m.selectAfterLoad
 	m.selectAfterLoad = ""
 	m.rebuild(preferredSkill)
-	if len(warnings) > 0 {
-		m.status = fmt.Sprintf("Loaded %d skills with %d warnings", len(items), len(warnings))
+	if !discovery.Complete() {
+		m.status = fmt.Sprintf("Loaded %d non-plugin skills; plugin status unavailable", len(items))
+	} else if len(discovery.Warnings) > 0 {
+		m.status = fmt.Sprintf("Loaded %d skills with %d warnings", len(items), len(discovery.Warnings))
 	} else {
 		m.status = fmt.Sprintf("Loaded %d skills", len(items))
 	}
@@ -1096,8 +1099,8 @@ func (m uiModel) summarizePresentations() presentationSummary {
 
 func (m uiModel) loadCmd() tea.Cmd {
 	return func() tea.Msg {
-		items, warnings, err := m.manager.List(m.ctx, m.project)
-		return loadedMsg{items: items, warnings: warnings, err: err}
+		items, discovery, err := m.manager.List(m.ctx, m.project)
+		return loadedMsg{items: items, discovery: discovery, err: err}
 	}
 }
 

@@ -89,6 +89,9 @@ func (m uiModel) headerView() string {
 		summary.Total, summary.Implicit, summary.Manual, summary.Disabled))
 	states := m.summarizePresentations()
 	var badges []string
+	if !m.discovery.Complete() {
+		badges = append(badges, warnStyle.Render("! plugin status unavailable"))
+	}
 	if states.Drift > 0 {
 		badges = append(badges, driftStyle.Render(fmt.Sprintf("! %d drift", states.Drift)))
 	}

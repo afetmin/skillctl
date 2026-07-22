@@ -1,11 +1,24 @@
 package tui
 
 import (
+	"strings"
 	"testing"
 
 	"skillctl/internal/model"
 	"skillctl/internal/service"
 )
+
+func TestHeaderShowsUnavailablePluginStatus(t *testing.T) {
+	m := uiModel{
+		width:     120,
+		discovery: model.DiscoveryReport{Status: model.DiscoveryPartialUnsupported},
+		pending:   map[string]pendingChange{},
+		applied:   map[string]bool{},
+	}
+	if header := m.headerView(); !strings.Contains(header, "plugin status unavailable") {
+		t.Fatalf("header = %q", header)
+	}
+}
 
 func TestPresentationFor(t *testing.T) {
 	tests := []struct {

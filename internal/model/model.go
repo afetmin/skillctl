@@ -30,6 +30,29 @@ const (
 	ScopeOther  Scope = "other"
 )
 
+type DiscoveryStatus string
+
+const (
+	DiscoveryComplete           DiscoveryStatus = "complete"
+	DiscoveryPartialUnsupported DiscoveryStatus = "partial_unsupported"
+	DiscoveryPartialFailure     DiscoveryStatus = "partial_failure"
+)
+
+type DiscoveryWarning struct {
+	Code     string `json:"code"`
+	Message  string `json:"message"`
+	PluginID string `json:"plugin_id,omitempty"`
+}
+
+type DiscoveryReport struct {
+	Status   DiscoveryStatus    `json:"status"`
+	Warnings []DiscoveryWarning `json:"warnings,omitempty"`
+}
+
+func (r DiscoveryReport) Complete() bool {
+	return r.Status == DiscoveryComplete
+}
+
 type Skill struct {
 	ID          string   `json:"id"`
 	Name        string   `json:"name"`
@@ -70,13 +93,23 @@ type Change struct {
 }
 
 type SyncReport struct {
-	Scanned   int       `json:"scanned"`
-	Managed   int       `json:"managed"`
-	Changed   int       `json:"changed"`
-	Skipped   int       `json:"skipped"`
-	Conflicts int       `json:"conflicts"`
-	DryRun    bool      `json:"dry_run"`
-	Changes   []Change  `json:"changes"`
-	Warnings  []string  `json:"warnings,omitempty"`
-	At        time.Time `json:"at"`
+	Scanned   int                `json:"scanned"`
+	Managed   int                `json:"managed"`
+	Changed   int                `json:"changed"`
+	Skipped   int                `json:"skipped"`
+	Conflicts int                `json:"conflicts"`
+	DryRun    bool               `json:"dry_run"`
+	Changes   []Change           `json:"changes"`
+	Warnings  []DiscoveryWarning `json:"warnings,omitempty"`
+	Discovery DiscoveryReport    `json:"discovery"`
+	Orphans   []OrphanRecord     `json:"orphans,omitempty"`
+	At        time.Time          `json:"at"`
+}
+
+type OrphanRecord struct {
+	Kind      string          `json:"kind"`
+	Selector  string          `json:"selector,omitempty"`
+	SkillID   string          `json:"skill_id,omitempty"`
+	SkillPath string          `json:"skill_path,omitempty"`
+	Desired   InvocationState `json:"desired,omitempty"`
 }

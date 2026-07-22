@@ -60,6 +60,8 @@ skillctl init --apply
 
 策略修改只保证对新 Codex 任务生效。当前任务中已经注入的描述无法被移除；Codex 没有刷新 Skill 列表时需要重启 Codex。
 
+插件清单以 Codex app-server 的 `plugin/installed` 为准。skillctl 只展示已安装且启用的插件，并只从其精确版本目录补充被单独禁用的 Skill；旧版本、已卸载插件和插件级禁用包即使仍留在缓存中也不会进入清单。
+
 ## 常用命令
 
 ```bash
@@ -93,7 +95,7 @@ skillctl disable some-skill
 # 只改配置，不立即同步
 skillctl manual grill-me --no-sync
 
-# 检测漂移；发现漂移时退出码为 3
+# 检测漂移和孤立的保留配置；发现任一问题时退出码为 3
 skillctl doctor
 
 # 恢复 skillctl 接管前的策略
@@ -208,12 +210,14 @@ skillctl sync --dry-run --json
 skillctl doctor --json
 ```
 
+`list --json` 的 `discovery.status` 会区分完整清单、Codex 版本不支持权威插件查询，以及临时查询失败；warning 以带 `code` 的对象输出。插件查询不可用时，`list` 和 TUI 仍展示非插件 Skill，`sync` 与 `doctor` 则在写入前停止。明确指定的非插件 `set` 在目标可安全解析和修改时仍可继续。
+
 | 退出码 | 含义 |
 | --- | --- |
 | `0` | 成功或没有漂移 |
 | `1` | 操作失败 |
 | `2` | 配置或命令参数错误 |
-| `3` | 检测到策略漂移 |
+| `3` | 检测到策略漂移或孤立的保留配置 |
 | `4` | 写入或恢复冲突 |
 
 ## 安全边界
