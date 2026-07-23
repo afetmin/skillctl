@@ -13,24 +13,19 @@ import (
 type Category string
 
 const (
-	CategorySystem   Category = "system"
 	CategoryPersonal Category = "personal"
-	CategoryPlugins  Category = "plugins"
 	CategoryProject  Category = "project"
-	CategoryOther    Category = "other"
 )
 
 var categoryOrder = map[Category]int{
-	CategorySystem:   0,
-	CategoryPersonal: 1,
-	CategoryPlugins:  2,
-	CategoryProject:  3,
-	CategoryOther:    4,
+	CategoryPersonal: 0,
+	CategoryProject:  1,
 }
 
 type Summary struct {
 	Total    int `json:"total"`
 	Implicit int `json:"implicit"`
+	NameOnly int `json:"name_only"`
 	Manual   int `json:"manual"`
 	Disabled int `json:"disabled"`
 	Drift    int `json:"drift"`
@@ -110,6 +105,9 @@ func matchesSourceKey(item service.SkillStatus, sourceKey string) bool {
 func GroupStatuses(items []service.SkillStatus) []Group {
 	byKey := map[string]*Group{}
 	for _, item := range items {
+		if item.Scope != model.ScopeUser && item.Scope != model.ScopeRepo {
+			continue
+		}
 		category, key, label := location(item)
 		group := byKey[key]
 		if group == nil {
@@ -142,7 +140,7 @@ func GroupStatuses(items []service.SkillStatus) []Group {
 
 func Options(groups []Group) []SourceOption {
 	options := []SourceOption{{Key: "all", Label: "All", Count: total(groups)}}
-	for _, category := range []Category{CategorySystem, CategoryPersonal, CategoryPlugins, CategoryProject, CategoryOther} {
+	for _, category := range []Category{CategoryPersonal, CategoryProject} {
 		count := 0
 		var matching []Group
 		for _, group := range groups {
@@ -190,19 +188,24 @@ func SourceOptions(items []service.SkillStatus, filter Filter) []SourceOption {
 	return options
 }
 
-func StateOptions(items []service.SkillStatus, filter Filter) []StateOption {
+func StateOptions(items []service.SkillStatus, filter Filter, valid []model.InvocationState) []StateOption {
 	filter.State = ""
 	matching := Apply(items, filter)
 	summary := Summary{}
 	for _, item := range matching {
 		addSummary(&summary, item)
 	}
-	return []StateOption{
-		{Label: "All", Count: summary.Total},
-		{State: model.StateImplicit, Label: "Implicit", Count: summary.Implicit},
-		{State: model.StateManual, Label: "Manual", Count: summary.Manual},
-		{State: model.StateDisabled, Label: "Disabled", Count: summary.Disabled},
+	result := []StateOption{{Label: "All", Count: summary.Total}}
+	counts := map[model.InvocationState]int{
+		model.StateImplicit: summary.Implicit,
+		model.StateNameOnly: summary.NameOnly,
+		model.StateManual:   summary.Manual,
+		model.StateDisabled: summary.Disabled,
 	}
+	for _, state := range valid {
+		result = append(result, StateOption{State: state, Label: stateLabel(state), Count: counts[state]})
+	}
+	return result
 }
 
 func Select(groups []Group, option SourceOption) []Group {
@@ -222,20 +225,20 @@ func Select(groups []Group, option SourceOption) []Group {
 
 func CategoryTitle(category Category) string {
 	switch category {
-	case CategorySystem:
-		return "System"
 	case CategoryPersonal:
 		return "Personal"
-	case CategoryPlugins:
-		return "Plugins"
 	case CategoryProject:
 		return "Project"
 	default:
-		return "Other"
+		return "Unsupported"
 	}
 }
 
-func SummaryLine(summary Summary) string {
+func SummaryLine(summary Summary, agent model.Agent) string {
+	if agent == model.AgentClaude {
+		return fmt.Sprintf("%d skills · implicit %d · name-only %d · manual %d · disabled %d · drift %d",
+			summary.Total, summary.Implicit, summary.NameOnly, summary.Manual, summary.Disabled, summary.Drift)
+	}
 	return fmt.Sprintf("%d skills · implicit %d · manual %d · disabled %d · drift %d",
 		summary.Total, summary.Implicit, summary.Manual, summary.Disabled, summary.Drift)
 }
@@ -245,6 +248,8 @@ func addSummary(summary *Summary, item service.SkillStatus) {
 	switch item.Actual {
 	case model.StateImplicit:
 		summary.Implicit++
+	case model.StateNameOnly:
+		summary.NameOnly++
 	case model.StateManual:
 		summary.Manual++
 	case model.StateDisabled:
@@ -265,24 +270,14 @@ func total(groups []Group) int {
 
 func location(item service.SkillStatus) (Category, string, string) {
 	switch item.Scope {
-	case model.ScopeSystem:
-		return CategorySystem, "system:codex", "~/.codex/skills/.system"
-	case model.ScopePlugin:
-		label := strings.ReplaceAll(item.Source, ":", "/")
-		return CategoryPlugins, "plugin:" + item.Source, label
 	case model.ScopeRepo:
 		label := projectRoot(item.Path)
 		return CategoryProject, "project:" + label, label
 	case model.ScopeUser:
 		label := personalLabel(item.Source)
 		return CategoryPersonal, "personal:" + item.Source, label
-	default:
-		label := item.Source
-		if label == "" {
-			label = filepath.Dir(item.Path)
-		}
-		return CategoryOther, "other:" + label, label
 	}
+	return "", "", ""
 }
 
 func personalLabel(source string) string {
@@ -293,10 +288,6 @@ func personalLabel(source string) string {
 		return "~/.codex/skills"
 	case "claude":
 		return "~/.claude/skills"
-	case "cc-switch":
-		return "~/.cc-switch/skills"
-	case "codex-superpowers":
-		return "~/.codex/superpowers/skills"
 	default:
 		return source
 	}
@@ -307,5 +298,23 @@ func projectRoot(path string) string {
 	if prefix, _, ok := strings.Cut(clean, "/.agents/skills/"); ok {
 		return prefix + "/.agents/skills"
 	}
+	if prefix, _, ok := strings.Cut(clean, "/.claude/skills/"); ok {
+		return prefix + "/.claude/skills"
+	}
 	return filepath.Dir(path)
+}
+
+func stateLabel(state model.InvocationState) string {
+	switch state {
+	case model.StateImplicit:
+		return "Implicit"
+	case model.StateNameOnly:
+		return "Name only"
+	case model.StateManual:
+		return "Manual"
+	case model.StateDisabled:
+		return "Disabled"
+	default:
+		return string(state)
+	}
 }

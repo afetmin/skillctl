@@ -51,6 +51,9 @@ func (m uiModel) View() string {
 	if m.help {
 		return m.helpView()
 	}
+	if m.switchConfirm {
+		return m.switchConfirmView()
+	}
 	if m.deleteConfirm {
 		return m.deleteConfirmView()
 	}
@@ -85,12 +88,16 @@ func (m uiModel) mainView() string {
 
 func (m uiModel) headerView() string {
 	summary := summarizeGroups(m.groups)
-	line := titleStyle.Render("skillctl") + "  " + mutedStyle.Render(fmt.Sprintf("%d skills · implicit %d · manual %d · disabled %d",
-		summary.Total, summary.Implicit, summary.Manual, summary.Disabled))
+	counts := fmt.Sprintf("%d skills · implicit %d", summary.Total, summary.Implicit)
+	if m.manager.Agent == model.AgentClaude {
+		counts += fmt.Sprintf(" · name-only %d", summary.NameOnly)
+	}
+	counts += fmt.Sprintf(" · manual %d · disabled %d", summary.Manual, summary.Disabled)
+	line := titleStyle.Render("skillctl") + "  " + m.agentControlView() + "  " + mutedStyle.Render(counts)
 	states := m.summarizePresentations()
 	var badges []string
 	if !m.discovery.Complete() {
-		badges = append(badges, warnStyle.Render("! plugin status unavailable"))
+		badges = append(badges, warnStyle.Render("! state verification incomplete"))
 	}
 	if states.Drift > 0 {
 		badges = append(badges, driftStyle.Render(fmt.Sprintf("! %d drift", states.Drift)))
@@ -111,6 +118,24 @@ func (m uiModel) headerView() string {
 		line += "  " + strings.Join(badges, "  ")
 	}
 	return fitLine(line, m.width)
+}
+
+func (m uiModel) agentControlView() string {
+	parts := []string{headingStyle.Render("AGENT")}
+	for index, candidate := range m.agents {
+		label := " " + agentLabel(candidate) + " "
+		if candidate == m.manager.Agent {
+			if m.focus == focusAgent {
+				label = focusedStateStyle.Render(label)
+			} else {
+				label = selectedStyle.Render(label)
+			}
+		} else if index != m.agentIndex {
+			label = mutedStyle.Render(label)
+		}
+		parts = append(parts, label)
+	}
+	return strings.Join(parts, " ")
 }
 
 func (m uiModel) searchView() string {
@@ -202,7 +227,7 @@ func (m uiModel) tableView(width, height int) []string {
 			if m.collapsed[row.GroupKey] {
 				indicator = "▸"
 			}
-			line = fmt.Sprintf("%s %s / %s  %s", indicator, inventory.CategoryTitle(row.Group.Category), row.Group.Label, inventory.SummaryLine(row.Group.Summary))
+			line = fmt.Sprintf("%s %s / %s  %s", indicator, inventory.CategoryTitle(row.Group.Category), row.Group.Label, inventory.SummaryLine(row.Group.Summary, m.manager.Agent))
 			line = groupStyle.Render(fitLine(line, width))
 		} else {
 			line = m.skillLine(row.Skill, width, m.focus == focusTable && index == m.rowIndex)
@@ -256,13 +281,17 @@ func (m uiModel) footerView() string {
 	if m.err != nil {
 		status = errorStyle.Render(m.err.Error())
 	}
+	stageKeys := "i/m/d"
+	if m.manager.Agent == model.AgentClaude {
+		stageKeys = "i/n/m/d"
+	}
 	hints := []keyHint{
-		{"Tab", "pane"}, {"↑/↓", "move"}, {"Enter", "open"}, {"i/m/d", "stage"},
+		{"c", "agent"}, {"Tab", "pane"}, {"↑/↓", "move"}, {"Enter", "open"}, {stageKeys, "stage"},
 		{"a", "apply"}, {"/", "search"}, {"h", "help"}, {"q", "quit"},
 	}
 	if leftWidth, _, _, _ := m.layout(); leftWidth == 0 {
 		hints = []keyHint{
-			{"[/]", "status"}, {"Tab", "pane"}, {"↑/↓", "move"}, {"Enter", "open"},
+			{"c", "agent"}, {"[/]", "status"}, {"Tab", "pane"}, {"↑/↓", "move"}, {"Enter", "open"},
 			{"a", "apply"}, {"/", "search"}, {"h", "help"}, {"q", "quit"},
 		}
 	}
@@ -315,10 +344,17 @@ func alignRight(left, right string, width int) string {
 
 func (m uiModel) helpView() string {
 	contentWidth := max(1, min(68, m.width-6))
+	stageKeys := "i / m / d"
+	stageDescription := "Stage implicit, manual, or disabled"
+	if m.manager.Agent == model.AgentClaude {
+		stageKeys = "i / n / m / d"
+		stageDescription = "Stage implicit, name-only, manual, or disabled"
+	}
 	lines := []string{
 		titleStyle.Render("Keyboard shortcuts"),
 		"",
 		headingStyle.Render("Navigation"),
+		helpLine("c or Agent ← / →", "Switch the complete Agent context", contentWidth),
 		helpLine("Tab / Shift+Tab", "Switch pane", contentWidth),
 		helpLine("↑ / ↓ or j / k", "Move selection", contentWidth),
 		helpLine("[ / ]", "Change status filter", contentWidth),
@@ -333,7 +369,7 @@ func (m uiModel) helpView() string {
 		"",
 		headingStyle.Render("Actions"),
 		helpLine("Enter", "Open skill or toggle group", contentWidth),
-		helpLine("i / m / d", "Stage implicit, manual, or disabled", contentWidth),
+		helpLine(stageKeys, stageDescription, contentWidth),
 		helpLine("a / u / Esc", "Apply, clear all, or undo current", contentWidth),
 		helpLine("x / r / o", "Delete, refresh, or open in editor", contentWidth),
 		helpLine("/", "Search skills", contentWidth),
@@ -480,6 +516,23 @@ func (m uiModel) confirmView() string {
 	return fitScreen(lines, m.width, m.height)
 }
 
+func (m uiModel) switchConfirmView() string {
+	lines := []string{
+		titleStyle.Render("Switch Agent?"),
+		"",
+		fmt.Sprintf("Switch %s to %s with %d pending changes.", agentLabel(m.manager.Agent), agentLabel(m.switchTarget), len(m.pending)),
+		"",
+	}
+	choices := []string{" Cancel ", " Discard and switch ", " Apply and switch "}
+	for index := range choices {
+		if index == m.switchChoice {
+			choices[index] = selectedStyle.Render(choices[index])
+		}
+	}
+	lines = append(lines, strings.Join(choices, "  "), "", mutedStyle.Render("←/→ or Tab choose  Enter confirm  Esc cancel"))
+	return fitScreen(lines, m.width, m.height)
+}
+
 func (m uiModel) detailView() string {
 	skill, ok := m.currentSkill()
 	if !ok {
@@ -499,19 +552,26 @@ func (m uiModel) detailView() string {
 		lines = append(lines, field("Target", string(presentation.Target)))
 	}
 	lines = append(lines,
+		field("Agent", agentLabel(skill.Agent)),
 		field("Condition", string(presentation.Condition)),
 		field("Managed", fmt.Sprintf("%t", skill.Managed)),
 		field("Scope", string(skill.Scope)),
 		field("Source", skill.Source),
 		field("Skill path", skill.Path),
-		field("Policy path", skill.PolicyPath),
-		field("Policy value", policyValue),
 	)
+	if skill.BlockedBy != "" {
+		lines = append(lines, field("Blocked by", skill.BlockedBy))
+	}
+	if skill.Agent == model.AgentCodex {
+		lines = append(lines, field("Policy path", skill.PolicyPath), field("Policy value", policyValue))
+	} else if skill.Journal != nil {
+		lines = append(lines, field("Settings path", skill.Journal.OverridePath))
+	}
 	if skill.Journal == nil {
 		lines = append(lines, field("Original state", "not recorded"), field("Last sync", "never"))
 	} else {
 		lines = append(lines,
-			field("Original state", string(originalState(skill))),
+			field("Original state", originalState(skill)),
 			field("Last sync", formatTime(skill.Journal.LastSyncedAt)),
 		)
 	}
@@ -575,10 +635,23 @@ func stateMarker(state model.InvocationState) string {
 	switch state {
 	case model.StateImplicit:
 		return "●"
+	case model.StateNameOnly:
+		return "◐"
 	case model.StateManual:
 		return "◆"
 	default:
 		return "○"
+	}
+}
+
+func agentLabel(agent model.Agent) string {
+	switch agent {
+	case model.AgentCodex:
+		return "Codex"
+	case model.AgentClaude:
+		return "Claude"
+	default:
+		return string(agent)
 	}
 }
 
@@ -645,6 +718,7 @@ func summarizeGroups(groups []inventory.Group) inventory.Summary {
 	for _, group := range groups {
 		result.Total += group.Summary.Total
 		result.Implicit += group.Summary.Implicit
+		result.NameOnly += group.Summary.NameOnly
 		result.Manual += group.Summary.Manual
 		result.Disabled += group.Summary.Disabled
 		result.Drift += group.Summary.Drift
@@ -652,15 +726,35 @@ func summarizeGroups(groups []inventory.Group) inventory.Summary {
 	return result
 }
 
-func originalState(skill service.SkillStatus) model.InvocationState {
+func originalState(skill service.SkillStatus) string {
 	entry := skill.Journal
-	if entry == nil || !entry.OriginalEnabled {
-		return model.StateDisabled
+	if entry == nil {
+		return "not recorded"
+	}
+	if skill.Agent == model.AgentClaude {
+		if !entry.OriginalOverridePresent {
+			return "inherited (override absent)"
+		}
+		switch entry.OriginalOverrideValue {
+		case "on":
+			return string(model.StateImplicit)
+		case "name-only":
+			return string(model.StateNameOnly)
+		case "user-invocable-only":
+			return string(model.StateManual)
+		case "off":
+			return string(model.StateDisabled)
+		default:
+			return "unknown (" + entry.OriginalOverrideValue + ")"
+		}
+	}
+	if !entry.OriginalEnabled {
+		return string(model.StateDisabled)
 	}
 	if entry.OriginalPolicyPresent && !entry.OriginalPolicyValue {
-		return model.StateManual
+		return string(model.StateManual)
 	}
-	return model.StateImplicit
+	return string(model.StateImplicit)
 }
 
 func formatTime(value time.Time) string {

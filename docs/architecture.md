@@ -1,35 +1,47 @@
 # Architecture
 
-## Desired state and local state
+## One active Agent
 
-`config.yaml` is the portable desired state. It contains stable Skill IDs and policy lists but no machine paths.
+Every command resolves exactly one Agent before creating a `service.Manager`. An explicit `--agent` is command-local. Without it, `internal/agent` checks configured executables in the stable order Codex then Claude.
 
-`state.json` is the local recovery journal. It records the original policy and enabled state before the first mutation, plus the last hash written by `skillctl`. Keeping these files separate prevents machine-specific plugin cache paths from leaking into a dotfiles-friendly configuration.
+The TUI switches the complete Manager context. It never combines Agent inventories. A completed TUI switch writes only the watcher target in `runtime.json`; foreground CLI selection never writes that target.
 
-## Codex adapter
+## Desired and local state
 
-Discovery prefers the local Codex app-server:
+`config.yaml` is version 2 portable desired state. Its Codex and Claude sections independently own command, default state, active profile, and selectors. Profiles can explicitly select every Agent-supported state, including `manual`, so changing one Agent's default does not reinterpret another Agent's policy.
 
-1. Start `codex app-server --listen stdio://`.
-2. Complete the JSON-RPC initialize handshake.
-3. Call `plugin/installed` with the Manager's current working directory.
-4. Call `skills/list` with `forceReload: true`.
-5. Reconcile both responses before any CLI or TUI grouping.
-
-`plugin/installed` is the authority for plugin membership. A plugin Skill is visible only when its marketplace-qualified plugin ID is reported as both installed and enabled. `skills/list` remains the primary source for active Skill metadata, while filesystem discovery continues to supply personal, system, and project Skills. Cache-only, uninstalled, and plugin-level disabled packages are discarded during the same reconciliation used by CLI and TUI. When app-server discovery is unavailable, filesystem fallback excludes plugin caches because their membership cannot be verified. Enabling and disabling still requires app-server because Codex owns that configuration.
-
-## Policy reconciliation
-
-The reconciler computes one desired state for every managed Skill:
-
-1. A matching `disabled` selector wins.
-2. A matching `implicit` selector enables implicit invocation.
-3. Everything else uses the global `manual` default.
-
-System and admin Skills are skipped. Repository Skills are skipped unless the caller explicitly enables project management.
-
-For `implicit` and `manual`, the adapter ensures the Skill is enabled and changes only `policy.allow_implicit_invocation`. For `disabled`, it calls `skills/config/write` with the marketplace-qualified Skill config name for plugin Skills and the absolute path for non-plugin Skills.
+Recovery data is machine-local and split into `codex.json` and `claude.json`. `runtime.json` contains only the watcher target. Runtime accepts only these final formats; old data is backed up and manually converted outside the program.
 
 ## Adapter boundary
 
-The user-facing model is platform-neutral: discovery, stable IDs, the three invocation states, desired profiles, reconciliation reports, and restore journals. Codex-specific JSON-RPC and `agents/openai.yaml` behavior lives under `internal/codex` and `internal/policy`. Future Agent adapters can map the same three states to their native controls.
+`internal/adapter.Adapter` owns Agent-specific discovery, supported states, prepare, apply, restore, delete, and close behavior. `service.Manager` owns resolution, personal/project gating, desired-state reconciliation, partial result reporting, orphans, and separate journal persistence.
+
+Both adapters emit only personal and project Skills. Plugin, system, admin, and unknown scopes never enter the shared inventory.
+
+## Codex
+
+Filesystem roots are the ownership source:
+
+- personal: `~/.agents/skills` and `~/.codex/skills`;
+- project: ancestor `.agents/skills` roots from the repository root through the current directory.
+
+The app-server is used only for `config/read` and `skills/config/write` on supported absolute paths. If enabled state cannot be verified, inventory is withheld and reconciliation fails rather than presenting or writing a guessed state. `implicit` and `manual` update only `policy.allow_implicit_invocation` in `agents/openai.yaml`; `disabled` changes enabled state. Plugin APIs and caches are not queried.
+
+## Claude
+
+Claude discovery reads `~/.claude/skills` plus ancestor `.claude/skills` roots. Personal definitions win same-name collisions over project definitions; the repository-root project definition wins over deeper ancestor definitions. Shadowed definitions remain visible and read-only.
+
+Effective `skillOverrides` precedence is project-local, project-shared, user, then default `on`. Personal changes write user settings. Project changes require explicit project mode and write only `.claude/settings.local.json`.
+
+State mapping is:
+
+- `implicit` -> `on`
+- `name-only` -> `name-only`
+- `manual` -> `user-invocable-only`
+- `disabled` -> `off`
+
+Settings are decoded as structured JSON and only the selected override key is changed. Recovery compares that key only. An originally absent key is restored by deletion. Managed Settings are detected and reported as unsupported rather than included in effective-state calculation.
+
+## Watcher
+
+The watcher reads its Agent from `runtime.json`, lets an active synchronous reconciliation finish, then observes a changed target on a dedicated fast target poll and immediately reconciles the new Agent. Fingerprints contain only the selected Agent's configuration, journal, supported Skill inputs, and Claude settings inputs. Partial conflicts are printed as incomplete and retried without being reported as success.

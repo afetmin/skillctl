@@ -1,50 +1,54 @@
 # skillctl
 
-`skillctl` 控制哪些 Agent Skill 会进入模型的初始上下文。首版只实现 Codex adapter，但配置、状态和命令模型没有绑定到单一 Agent。
+`skillctl` 管理 Codex 和 Claude 的个人、项目 Skill 调用状态。每次命令只处理一个 Agent；两个 Agent 的清单、配置、恢复日志和同步结果不会混在一起。
 
-默认策略是严格白名单：
+插件 Skill、系统 Skill、管理员 Skill 和未知来源不在产品范围内，既不展示也不修改。
 
-- Codex 系统 Skill 不受管理。
-- 用户和插件 Skill 默认是 `manual`。
-- 初始 `implicit` 白名单为空。
-- 项目内 `.agents/skills` 默认只读。
-- 手动 Skill 仍可直接通过 `$skill-name` 调用。
+## Agent 与状态
 
-## 三种状态
+没有 `--agent` 时，skillctl 检测配置中的命令是否已安装，固定按 Codex、Claude 的顺序选择。两个都存在时选择 Codex。`--agent` 只影响当前命令，不会改变 watcher：
 
-| 状态 | 初始上下文 | 模型自动调用 | `$skill-name` |
-| --- | --- | --- | --- |
-| `implicit` | 包含描述 | 允许 | 允许 |
-| `manual` | 不包含常规 Skill 描述 | 不允许 | 允许 |
-| `disabled` | 不包含 | 不允许 | 不允许 |
-
-`manual` 通过 Skill 的 `agents/openai.yaml` 设置：
-
-```yaml
-policy:
-  allow_implicit_invocation: false
+```bash
+skillctl --agent codex list
+skillctl --agent claude list
 ```
 
-`disabled` 通过 Codex app-server 的 `skills/config/write` 管理，不直接重写 `~/.codex/config.toml`。
+| skillctl 状态 | Codex | Claude `skillOverrides` |
+| --- | --- | --- |
+| `implicit` | 启用，允许隐式调用 | `on` |
+| `name-only` | 不支持 | `name-only` |
+| `manual` | 启用，禁止隐式调用 | `user-invocable-only` |
+| `disabled` | 禁用 | `off` |
+
+Codex 的 `manual` 写入 Skill 自己的 `agents/openai.yaml`；启用与禁用通过 Codex app-server 的 `skills/config/write` 按绝对路径写入。Claude 只修改 settings JSON 中目标 Skill 对应的一个 `skillOverrides` 字段，并保留其他设置。
+
+## 支持的目录
+
+| Agent | 个人 Skill | 项目 Skill |
+| --- | --- | --- |
+| Codex | `~/.agents/skills/*/SKILL.md`、`~/.codex/skills/*/SKILL.md` | 从当前目录到仓库根的 `.agents/skills/*/SKILL.md` |
+| Claude | `~/.claude/skills/*/SKILL.md` | 从当前目录到仓库根的 `.claude/skills/*/SKILL.md` |
+
+不会向下扫描当前工作目录之外的项目子目录。项目 Skill 默认只读，只有带 `--project` 的命令才会同步、恢复或删除它们。
+
+Claude 同名 Skill 按个人优先于项目、仓库根优先于更深项目目录处理。胜出的定义可操作，其余定义仍显示为 shadowed 且只读。实际状态按项目本地、项目共享、用户、默认值的顺序计算。项目写入只落到 `.claude/settings.local.json`，不会修改共享的 `.claude/settings.json`。
+
+Claude Managed Settings 暂不参与有效状态计算；检测到时 `list`、`doctor` 和 TUI 会明确警告。Claude 的 settings 与 Skills 说明见[官方文档](https://code.claude.com/docs/en/settings)。
 
 ## 构建和安装
 
-要求：Go 1.24.2+，以及可执行的 `codex` CLI。
+要求 Go 1.24.2+，以及至少一个可执行的 `codex` 或 `claude` 命令。
 
 ```bash
 make build
 make install
 ```
 
-默认安装到 `~/.local/bin/skillctl`。可以覆盖安装目录：
-
-```bash
-make install PREFIX=/usr/local
-```
+默认安装到 `~/.local/bin/skillctl`，可以用 `PREFIX=/usr/local` 覆盖。
 
 ## 首次使用
 
-首次运行 `skillctl` 或 `skillctl tui` 会自动创建默认配置，不会立即改动已安装 Skill。也可以显式初始化：
+首次运行 TUI 会创建最终版配置，但不会立即修改 Skill。也可以显式执行：
 
 ```bash
 skillctl init
@@ -52,179 +56,129 @@ skillctl sync --dry-run
 skillctl sync
 ```
 
-也可以明确要求初始化后立即应用：
-
-```bash
-skillctl init --apply
-```
-
-策略修改只保证对新 Codex 任务生效。当前任务中已经注入的描述无法被移除；Codex 没有刷新 Skill 列表时需要重启 Codex。
-
-插件清单以 Codex app-server 的 `plugin/installed` 为准。skillctl 只展示已安装且启用的插件，并只从其精确版本目录补充被单独禁用的 Skill；旧版本、已卸载插件和插件级禁用包即使仍留在缓存中也不会进入清单。
+skillctl 只接受 `version: 2` 的最终配置。旧格式不会自动解析或迁移；升级时先备份，再手动把仍受支持的个人、项目策略放入对应 Agent 段，并删除旧插件记录。
 
 ## 常用命令
 
 ```bash
-# 交互管理（TTY 中不带子命令也会打开）
-skillctl
-skillctl tui
-
-# 查看所有 Skill 的实际状态和期望状态
+skillctl                         # 打开 TUI
 skillctl list
-
-# 筛选条件可以组合，条件之间是 AND
-skillctl list --state manual --scope plugin
-skillctl list --drift
-skillctl list --source vercel
-
-# 查看单个 Skill
+skillctl list --scope personal
+skillctl list --scope project --project
 skillctl status grill-me
 
-# 设为允许隐式调用
-skillctl set code-review implicit
-skillctl allow code-review
-
-# 设为仅手动调用
-skillctl set grill-me manual
+skillctl allow grill-me
 skillctl manual grill-me
+skillctl disable grill-me
+skillctl --agent claude name-only grill-me
+skillctl set grill-me name-only --agent claude
 
-# 完全禁用
-skillctl set some-skill disabled
-skillctl disable some-skill
-
-# 只改配置，不立即同步
-skillctl manual grill-me --no-sync
-
-# 检测漂移和孤立的保留配置；发现任一问题时退出码为 3
+skillctl sync --dry-run
+skillctl sync --project --dry-run
 skillctl doctor
-
-# 恢复 skillctl 接管前的策略
 skillctl restore grill-me
-skillctl restore --all
+skillctl restore --all --project
 ```
 
-`list` 按 `System`、`Personal`、`Plugins`、`Project`、`Other` 的固定顺序分组，每组显示状态计数和漂移数，表格列为 `NAME ACTUAL DESIRED MANAGED PATH`。在管道或脚本中不能直接运行裸 `skillctl`，请显式使用 `skillctl list` 或 `skillctl list --json`。
-
-## 交互界面
-
-TUI 左侧分别按当前实际状态和来源筛选，右侧显示 Skill 表格；搜索、状态和来源按 AND 组合。窄终端会自动收起筛选栏。
-
-表格使用 `NAME STATE DESCRIPTION` 三列。`STATE` 默认只显示当前状态，存在漂移时仅在行首显示 `!`；用户暂存修改后才显示 `当前 → 目标`，并高亮目标状态。行首的 `~`、`×`、`✓` 分别表示待应用、冲突和本次会话已应用；不可管理的 Skill 标为 `只读`。描述保持单行，空值显示 `No description`；完整路径和描述可在详情页查看。搜索只匹配名称、描述、ID 和路径，来源与状态由各自的筛选器控制。
-
-| 按键 | 操作 |
-| --- | --- |
-| `Tab` | 在状态、来源和 Skill 表格之间切换焦点 |
-| `j` / `k`、方向键、鼠标 | 移动选择 |
-| `[` / `]` | 切换状态筛选 |
-| `←` / `→` | 切换来源 |
-| `Enter` | 展开分组或查看 Skill 详情 |
-| `/` | 搜索名称、描述、ID 或路径 |
-| `i` / `m` / `d` | 暂存为 `implicit` / `manual` / `disabled` |
-| `a` | 确认并一次性应用全部暂存修改；确认页支持 `j/k`、方向键、翻页键和鼠标滚动 |
-| `Esc` | 撤销当前 Skill 的暂存修改 |
-| `u` | 清空全部暂存修改 |
-| `r` | 立即刷新；界面也会自动检测外部变化 |
-| `o` | 用 `$EDITOR` 打开当前 Skill 的 `SKILL.md` |
-| `h` | 打开快捷键帮助 |
-| `q` | 退出 |
-
-外部配置或 Skill 文件变化不会静默覆盖暂存修改；基准状态变化后，该项会标为冲突并在应用时跳过。
-
-名称唯一时可以使用短名称。同名 Skill 必须使用 `skillctl list` 展示的完整 ID，例如：
+名称唯一时可以用短名称；同名 Skill 使用 `list` 输出的完整 ID，例如：
 
 ```text
 codex:user:agents:code-review
-codex:plugin:openai-curated-remote:vercel:nextjs
+claude:user:claude:code-review
+claude:repo:my-repo:code-review
 ```
 
-## 项目 Skill
+删除只对 TUI 当前选中的个人或已启用项目管理的 Skill 开放。删除目录符号链接时只删除链接本身；期望策略、Claude override 和恢复记录会保留为 orphan，重新安装同一 Skill 后再次生效。
 
-项目 Skill 默认不会被修改，防止弄脏仓库。只有显式传入 `--project` 才会管理当前项目：
+## TUI
 
-```bash
-skillctl sync --project --dry-run
-skillctl manual my-project-skill --project
-```
+顶部 Agent 控件是完整上下文切换，不是清单过滤器。按 `c` 或在 Agent 控件上使用左右键切换；切换后重新加载该 Agent 的清单、有效状态、期望 profile 和恢复日志，并更新 watcher 目标。
 
-后台 watcher 同样默认忽略项目 Skill。
+有暂存修改时，切换前必须选择 Apply and switch、Discard and switch 或 Cancel。Codex 只显示 `implicit`、`manual`、`disabled`，Claude 额外显示 `name-only`。
 
-## 可选后台守护
+| 按键 | 操作 |
+| --- | --- |
+| `c` | 切换 Agent |
+| `Tab` | 在 Agent、状态、来源和表格之间切换焦点 |
+| `j` / `k`、方向键、鼠标 | 移动选择 |
+| `i` / `n` / `m` / `d` | 暂存为 implicit / name-only / manual / disabled |
+| `a` | 应用全部暂存修改 |
+| `u` | 清空暂存修改 |
+| `Esc` | 撤销当前 Skill 的暂存修改 |
+| `x` | 删除当前可管理 Skill |
+| `/` | 搜索 |
+| `r` | 刷新 |
+| `o` | 用 `$EDITOR` 打开 `SKILL.md` |
+| `h` | 帮助 |
+| `q` | 退出 |
 
-前台运行：
+## Watcher
 
 ```bash
 skillctl watch
-skillctl watch --interval 10s
-```
-
-在 macOS 上注册为 LaunchAgent：
-
-```bash
+skillctl watch --project
 skillctl watch install --dry-run
 skillctl watch install
 skillctl watch status
 skillctl watch uninstall
 ```
 
-日志保存在 `~/.local/state/skillctl/watch.log`。
+watcher 目标保存在独立的 `runtime.json` 中。只有完成的 TUI Agent 切换会修改它；普通 `--agent` 不会。切换发生在当前同步结束后，新 Agent 会立即同步。单个 Skill 冲突不会阻止其他有效变更，watcher 会记录 incomplete 并继续运行。
 
 ## 配置和状态
 
-期望策略保存在：
+便携期望配置：
+
+```yaml
+version: 2
+agents:
+  codex:
+    command: codex
+    active_profile: default
+    defaults:
+      invocation: manual
+    profiles:
+      default:
+        implicit: []
+        manual: []
+        disabled: []
+  claude:
+    command: claude
+    active_profile: default
+    defaults:
+      invocation: manual
+    profiles:
+      default:
+        implicit: []
+        name_only: []
+        manual: []
+        disabled: []
+```
+
+两个 Agent 的 `defaults.invocation` 可以独立设置，但必须是该 Agent 支持的状态。profile 可用 `manual` 等显式 selector 覆盖各自默认值。
+
+默认文件：
 
 ```text
 ~/.config/skillctl/config.yaml
+~/.local/state/skillctl/codex.json
+~/.local/state/skillctl/claude.json
+~/.local/state/skillctl/runtime.json
+~/.local/state/skillctl/watch.log
 ```
 
-它不包含绝对路径，可以放进 dotfiles 跨机器同步：
-
-```yaml
-version: 1
-active_profile: default
-defaults:
-  invocation: manual
-profiles:
-  default:
-    implicit: []
-    disabled: []
-adapters:
-  codex:
-    command: codex
-```
-
-本机恢复信息保存在：
-
-```text
-~/.local/state/skillctl/state.json
-```
-
-状态文件包含本机路径、原始策略、文件指纹和同步时间，不应该跨机器同步。恢复时如果策略文件被外部修改，`skillctl` 会报告冲突，不覆盖新版内容。
+两个 Agent 的恢复日志完全分开。Claude 记录 override 原来是否存在、原值和 skillctl 最后写入值；恢复原本不存在的 override 时会删除该 key，而不是写一个显式默认值。
 
 ## JSON 和退出码
 
-查询及变更命令支持 `--json`：
-
-```bash
-skillctl list --json
-skillctl sync --dry-run --json
-skillctl doctor --json
-```
-
-`list --json` 的 `discovery.status` 会区分完整清单、Codex 版本不支持权威插件查询，以及临时查询失败；warning 以带 `code` 的对象输出。插件查询不可用时，`list` 和 TUI 仍展示非插件 Skill，`sync` 与 `doctor` 则在写入前停止。明确指定的非插件 `set` 在目标可安全解析和修改时仍可继续。
+`list`、`status`、`sync`、`doctor`、`restore` 和变更命令支持 `--json`。同步报告包含 Agent 身份，并分别列出 `applied_changes`、`skipped_changes` 和 `conflicted_changes` 及逐 Skill 原因。
 
 | 退出码 | 含义 |
 | --- | --- |
 | `0` | 成功或没有漂移 |
 | `1` | 操作失败 |
 | `2` | 配置或命令参数错误 |
-| `3` | 检测到策略漂移或孤立的保留配置 |
-| `4` | 写入或恢复冲突 |
+| `3` | 检测到漂移或 orphan |
+| `4` | 部分同步或恢复冲突 |
 
-## 安全边界
-
-- 修改 YAML 时使用 AST，不使用字符串替换。
-- 写入采用同目录临时文件和原子替换。
-- 只管理 `policy.allow_implicit_invocation`。
-- 首次改动前记录原始 enabled 和 policy 状态。
-- `restore` 只恢复 skillctl 接管的字段。
-- `.system` 和 admin Skill 永远跳过。
+所有 settings、policy、配置和日志写入都使用同目录临时文件与原子替换。恢复只操作 skillctl 接管的字段，发现同字段被外部修改时不会覆盖。

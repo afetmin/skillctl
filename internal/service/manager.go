@@ -5,55 +5,27 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 	"time"
 
-	"skillctl/internal/codex"
+	"skillctl/internal/adapter"
 	"skillctl/internal/config"
-	"skillctl/internal/fileutil"
 	"skillctl/internal/model"
-	"skillctl/internal/policy"
 	statestore "skillctl/internal/state"
 )
 
 type Manager struct {
+	Agent      model.Agent
 	ConfigPath string
-	StatePath  string
+	StateDir   string
 	CWD        string
-
-	openCodex          codexOpener
-	discoverFilesystem filesystemDiscoverer
-	pluginCacheRoot    string
 }
-
-type codexSession interface {
-	DiscoverSkills(cwd string) ([]model.Skill, []string, error)
-	ListInstalledPlugins(cwd string) (codex.InstalledPlugins, []string, error)
-	SetEnabled(path, name string, enabled bool) error
-	Close() error
-}
-
-type codexOpener func(context.Context, string, string) (codexSession, error)
-type filesystemDiscoverer func(string) ([]model.Skill, []string, error)
 
 type SyncOptions struct {
-	DryRun                bool
-	Project               bool
-	Selectors             []string
-	allowPartialNonPlugin bool
-}
-
-type InventoryUnavailableError struct {
-	Status model.DiscoveryStatus
-	Reason string
-}
-
-const pluginDiscoveryUpgradeMessage = "this Codex version does not support plugin/installed; upgrade Codex to manage plugin Skills"
-
-func (e *InventoryUnavailableError) Error() string {
-	return fmt.Sprintf("authoritative plugin inventory is unavailable (%s): %s", e.Status, e.Reason)
+	DryRun    bool
+	Project   bool
+	Selectors []string
 }
 
 type SkillStatus struct {
@@ -65,10 +37,19 @@ type SkillStatus struct {
 }
 
 type RestoreReport struct {
-	Restored  []string `json:"restored"`
-	Skipped   []string `json:"skipped,omitempty"`
-	Conflicts []string `json:"conflicts,omitempty"`
-	DryRun    bool     `json:"dry_run"`
+	Agent     model.Agent `json:"agent"`
+	Restored  []string    `json:"restored"`
+	Skipped   []string    `json:"skipped,omitempty"`
+	Conflicts []string    `json:"conflicts,omitempty"`
+	DryRun    bool        `json:"dry_run"`
+}
+
+func (m Manager) StatePath() string {
+	return statestore.Path(m.StateDir, m.Agent)
+}
+
+func (m Manager) ValidStates() []model.InvocationState {
+	return model.States(m.Agent)
 }
 
 func (m Manager) Init(ctx context.Context, force, apply bool) (config.Config, *model.SyncReport, error) {
@@ -77,7 +58,6 @@ func (m Manager) Init(ctx context.Context, force, apply bool) (config.Config, *m
 	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return config.Config{}, nil, err
 	}
-
 	cfg := config.Default()
 	if err := config.Save(m.ConfigPath, cfg); err != nil {
 		return config.Config{}, nil, err
@@ -94,11 +74,13 @@ func (m Manager) Discover(ctx context.Context) ([]model.Skill, model.DiscoveryRe
 	if err != nil {
 		return nil, model.DiscoveryReport{}, err
 	}
-	skills, discovery, client, err := m.discover(ctx, cfg)
-	if client != nil {
-		defer client.Close()
+	active, err := m.openAdapter(cfg)
+	if err != nil {
+		return nil, model.DiscoveryReport{}, err
 	}
-	return skills, discovery, err
+	defer active.Close()
+	skills, report, err := active.Discover(ctx)
+	return supportedInventory(m.Agent, skills), report, err
 }
 
 func (m Manager) List(ctx context.Context, project bool) ([]SkillStatus, model.DiscoveryReport, error) {
@@ -106,43 +88,50 @@ func (m Manager) List(ctx context.Context, project bool) ([]SkillStatus, model.D
 	if err != nil {
 		return nil, model.DiscoveryReport{}, configHint(m.ConfigPath, err)
 	}
-	skills, discovery, client, err := m.discover(ctx, cfg)
-	if client != nil {
-		defer client.Close()
+	agentConfig, err := cfg.Agent(m.Agent)
+	if err != nil {
+		return nil, model.DiscoveryReport{}, err
 	}
+	active, err := m.openAdapter(cfg)
+	if err != nil {
+		return nil, model.DiscoveryReport{}, err
+	}
+	defer active.Close()
+	skills, discovery, err := active.Discover(ctx)
 	if err != nil {
 		return nil, discovery, err
 	}
-	resolver := newResolver(skills)
-	profileWarnings, profileErr := resolver.validateProfile(cfg.Active())
-	warningCode := "orphaned_policy"
-	if !discovery.Complete() {
-		warningCode = "policy_unresolved"
+	if m.Agent == model.AgentCodex && discovery.Status == model.DiscoveryPartialFailure {
+		return []SkillStatus{}, discovery, nil
 	}
+	skills = supportedInventory(m.Agent, skills)
+	resolver := newResolver(skills)
+	profileWarnings, profileErr := resolver.validateProfile(agentConfig.Profiles[agentConfig.ActiveProfile])
 	for _, warning := range profileWarnings {
-		discovery.Warnings = append(discovery.Warnings, model.DiscoveryWarning{Code: warningCode, Message: warning})
+		discovery.Warnings = append(discovery.Warnings, model.DiscoveryWarning{Code: "orphaned_policy", Message: warning})
 	}
 	if profileErr != nil {
 		return nil, discovery, profileErr
 	}
-	localState, err := statestore.LoadOrDefault(m.StatePath)
+	localState, err := statestore.LoadOrDefault(m.StatePath(), m.Agent)
 	if err != nil {
 		return nil, discovery, err
 	}
-	var result []SkillStatus
+	result := make([]SkillStatus, 0, len(skills))
 	for _, skill := range skills {
-		managed := skill.ManagedByDefault() || (project && skill.Scope == model.ScopeRepo)
+		managed := !skill.ReadOnly && (skill.ManagedByDefault() || (project && skill.Scope == model.ScopeRepo))
 		actual := skill.ActualState()
 		desired := actual
 		if managed {
-			desired = resolver.desired(cfg, skill)
+			desired = resolver.desired(agentConfig, skill)
 		}
-		status := SkillStatus{
-			Skill:   skill,
-			Actual:  actual,
-			Desired: desired,
-			Managed: managed,
+		if skill.Scope == model.ScopeRepo && !project {
+			skill.ReadOnly = true
+			if skill.BlockedBy == "" {
+				skill.BlockedBy = "project management is disabled"
+			}
 		}
+		status := SkillStatus{Skill: skill, Actual: actual, Desired: desired, Managed: managed}
 		if entry, ok := localState.Entries[skill.Path]; ok {
 			entryCopy := entry
 			status.Journal = &entryCopy
@@ -153,9 +142,12 @@ func (m Manager) List(ctx context.Context, project bool) ([]SkillStatus, model.D
 }
 
 func (m Manager) Resolve(ctx context.Context, selector string) (model.Skill, error) {
-	skills, _, err := m.Discover(ctx)
+	skills, discovery, err := m.Discover(ctx)
 	if err != nil {
 		return model.Skill{}, err
+	}
+	if m.Agent == model.AgentCodex && discovery.Status == model.DiscoveryPartialFailure {
+		return model.Skill{}, errors.New("Codex inventory is unavailable because enabled state could not be verified")
 	}
 	return newResolver(skills).resolve(selector)
 }
@@ -176,26 +168,35 @@ func (m Manager) SetMany(ctx context.Context, changes map[string]model.Invocatio
 	if err != nil {
 		return nil, nil, configHint(m.ConfigPath, err)
 	}
-	discovered, _, client, err := m.discover(ctx, cfg)
-	if client != nil {
-		_ = client.Close()
-	}
+	active, err := m.openAdapter(cfg)
 	if err != nil {
 		return nil, nil, err
 	}
+	discovered, discovery, err := active.Discover(ctx)
+	_ = active.Close()
+	if err != nil {
+		return nil, nil, err
+	}
+	if m.Agent == model.AgentCodex && discovery.Status == model.DiscoveryPartialFailure {
+		return nil, nil, errors.New("Codex inventory is unavailable because enabled state could not be verified")
+	}
+	discovered = supportedInventory(m.Agent, discovered)
 	resolver := newResolver(discovered)
 	resolved := make([]model.Skill, 0, len(changes))
 	desiredByID := map[string]model.InvocationState{}
 	for selector, desired := range changes {
-		if !desired.Valid() {
-			return nil, nil, fmt.Errorf("invalid invocation state %q", desired)
+		if !model.ValidState(m.Agent, desired) {
+			return nil, nil, fmt.Errorf("%s does not support invocation state %q", m.Agent, desired)
 		}
 		skill, resolveErr := resolver.resolve(selector)
 		if resolveErr != nil {
 			return nil, nil, resolveErr
 		}
-		if skill.Scope == model.ScopeSystem || skill.Scope == model.ScopeAdmin {
-			return nil, nil, fmt.Errorf("%s is a %s skill and is outside skillctl management", skill.ID, skill.Scope)
+		if skill.ReadOnly {
+			return nil, nil, fmt.Errorf("%s is read-only: shadowed by %s", skill.ID, skill.BlockedBy)
+		}
+		if skill.Scope != model.ScopeUser && skill.Scope != model.ScopeRepo {
+			return nil, nil, fmt.Errorf("%s is outside %s personal and project Skill management", skill.ID, m.Agent)
 		}
 		if skill.Scope == model.ScopeRepo && !project {
 			return nil, nil, errors.New("project skills require --project")
@@ -205,8 +206,9 @@ func (m Manager) SetMany(ctx context.Context, changes map[string]model.Invocatio
 	}
 	sort.Slice(resolved, func(i, j int) bool { return resolved[i].ID < resolved[j].ID })
 	for _, skill := range resolved {
-		aliases := append([]string{skill.ConfigName}, skill.Aliases...)
-		cfg.SetState(skill.ID, skill.Name, desiredByID[skill.ID], aliases...)
+		if err := cfg.SetState(m.Agent, skill.ID, skill.Name, desiredByID[skill.ID], skill.Aliases...); err != nil {
+			return nil, nil, err
+		}
 	}
 	if err := config.Save(m.ConfigPath, cfg); err != nil {
 		return nil, nil, err
@@ -218,44 +220,46 @@ func (m Manager) SetMany(ctx context.Context, changes map[string]model.Invocatio
 	for _, skill := range resolved {
 		selectors = append(selectors, skill.ID)
 	}
-	report, err := m.Sync(ctx, SyncOptions{Project: project, Selectors: selectors, allowPartialNonPlugin: true})
+	report, err := m.Sync(ctx, SyncOptions{Project: project, Selectors: selectors})
 	return resolved, &report, err
 }
 
 func (m Manager) Sync(ctx context.Context, options SyncOptions) (model.SyncReport, error) {
-	report := model.SyncReport{DryRun: options.DryRun, At: time.Now(), Changes: []model.Change{}}
+	report := model.SyncReport{Agent: m.Agent, DryRun: options.DryRun, At: time.Now(), Changes: []model.Change{}}
 	cfg, err := config.Load(m.ConfigPath)
 	if err != nil {
 		return report, configHint(m.ConfigPath, err)
 	}
-	localState, err := statestore.LoadOrDefault(m.StatePath)
+	agentConfig, err := cfg.Agent(m.Agent)
 	if err != nil {
 		return report, err
 	}
-	skills, discovery, client, err := m.discover(ctx, cfg)
-	if client != nil {
-		defer client.Close()
+	localState, err := statestore.LoadOrDefault(m.StatePath(), m.Agent)
+	if err != nil {
+		return report, err
 	}
+	active, err := m.openAdapter(cfg)
+	if err != nil {
+		return report, err
+	}
+	defer active.Close()
+	skills, discovery, err := active.Discover(ctx)
 	report.Discovery = discovery
 	report.Warnings = append(report.Warnings, discovery.Warnings...)
 	if err != nil {
 		return report, err
 	}
-	if !discovery.Complete() && !partialSyncAllowed(options, skills) {
-		return report, inventoryUnavailable(discovery)
+	if m.Agent == model.AgentCodex && discovery.Status == model.DiscoveryPartialFailure {
+		return report, errors.New("Codex inventory is unavailable because enabled state could not be verified")
 	}
+	skills = supportedInventory(m.Agent, skills)
 	report.Scanned = len(skills)
 	resolver := newResolver(skills)
-	if discovery.Complete() {
-		report.Orphans = orphanRecords(cfg.Active(), localState, resolver)
-	}
-	profileWarnings, profileErr := resolver.validateProfile(cfg.Active())
-	warningCode := "orphaned_policy"
-	if !discovery.Complete() {
-		warningCode = "policy_unresolved"
-	}
+	profile := agentConfig.Profiles[agentConfig.ActiveProfile]
+	report.Orphans = orphanRecords(m.Agent, profile, localState, resolver)
+	profileWarnings, profileErr := resolver.validateProfile(profile)
 	for _, warning := range profileWarnings {
-		item := model.DiscoveryWarning{Code: warningCode, Message: warning}
+		item := model.DiscoveryWarning{Code: "orphaned_policy", Message: warning}
 		report.Discovery.Warnings = append(report.Discovery.Warnings, item)
 		report.Warnings = append(report.Warnings, item)
 	}
@@ -263,116 +267,115 @@ func (m Manager) Sync(ctx context.Context, options SyncOptions) (model.SyncRepor
 		return report, profileErr
 	}
 	selected := selectionSet(options.Selectors)
-
 	for _, skill := range skills {
 		if len(selected) > 0 && !selected[skill.ID] {
 			continue
 		}
-		managed := skill.ManagedByDefault() || (options.Project && skill.Scope == model.ScopeRepo)
+		managed := !skill.ReadOnly && (skill.ManagedByDefault() || (options.Project && skill.Scope == model.ScopeRepo))
 		if !managed {
 			report.Skipped++
+			desired := resolver.desired(agentConfig, skill)
+			actual := skill.ActualState()
+			if actual != desired {
+				reason := "project management is disabled"
+				blocked := skill.ReadOnly && (skill.Scope != model.ScopeRepo || options.Project)
+				if blocked {
+					reason = "read-only"
+					if skill.BlockedBy != "" {
+						reason += ": shadowed by " + skill.BlockedBy
+					}
+				}
+				change := model.Change{
+					Agent:   m.Agent,
+					SkillID: skill.ID,
+					Name:    skill.Name,
+					Path:    skill.Path,
+					From:    actual,
+					To:      desired,
+					Reason:  reason,
+				}
+				report.Changes = append(report.Changes, change)
+				if blocked {
+					report.Changed++
+					report.Conflicts++
+					report.ConflictedChanges = append(report.ConflictedChanges, change)
+				} else {
+					report.SkippedChanges = append(report.SkippedChanges, change)
+				}
+			}
 			continue
 		}
 		report.Managed++
-		desired := resolver.desired(cfg, skill)
+		desired := resolver.desired(agentConfig, skill)
 		actual := skill.ActualState()
-		if actual == desired {
+		needsApply, needsApplyErr := active.NeedsApply(skill, desired)
+		if needsApplyErr != nil {
+			change := model.Change{
+				Agent:   m.Agent,
+				SkillID: skill.ID,
+				Name:    skill.Name,
+				Path:    skill.Path,
+				From:    actual,
+				To:      desired,
+				Reason:  needsApplyErr.Error(),
+			}
+			report.Changed++
+			report.Conflicts++
+			report.Skipped++
+			report.Changes = append(report.Changes, change)
+			report.ConflictedChanges = append(report.ConflictedChanges, change)
+			continue
+		}
+		if !needsApply {
 			continue
 		}
 		report.Changed++
-		change := model.Change{SkillID: skill.ID, Name: skill.Name, Path: skill.Path, From: actual, To: desired}
+		change := model.Change{
+			Agent:   m.Agent,
+			SkillID: skill.ID,
+			Name:    skill.Name,
+			Path:    skill.Path,
+			From:    actual,
+			To:      desired,
+		}
+		var existing *statestore.Entry
+		if entry, ok := localState.Entries[skill.Path]; ok {
+			entryCopy := entry
+			existing = &entryCopy
+		}
+		entry, prepareErr := active.Prepare(skill, desired, existing)
+		if prepareErr != nil {
+			change.Reason = prepareErr.Error()
+			report.Conflicts++
+			report.Skipped++
+			report.Changes = append(report.Changes, change)
+			report.ConflictedChanges = append(report.ConflictedChanges, change)
+			continue
+		}
 		if options.DryRun {
 			report.Changes = append(report.Changes, change)
 			continue
 		}
-
-		entry, ok := localState.Entries[skill.Path]
-		if !ok {
-			snapshot, inspectErr := policy.Inspect(skill.PolicyPath)
-			if inspectErr != nil {
-				change.Message = inspectErr.Error()
-				report.Conflicts++
-				report.Changes = append(report.Changes, change)
-				continue
-			}
-			entry = statestore.Entry{
-				SkillID:               skill.ID,
-				SkillPath:             skill.Path,
-				SkillConfigName:       skill.ConfigName,
-				PluginID:              skill.PluginID,
-				PolicyPath:            skill.PolicyPath,
-				PolicyFileExisted:     snapshot.FileExisted,
-				OriginalPolicyPresent: snapshot.Present,
-				OriginalPolicyValue:   snapshot.Value,
-				OriginalEnabled:       skill.Enabled,
-			}
-		}
-
-		if desired == model.StateDisabled {
-			if client == nil {
-				change.Message = "Codex app-server is required to disable a skill"
-				report.Conflicts++
-				report.Changes = append(report.Changes, change)
-				continue
-			}
-			entry.ManagedEnabled = true
-			entry.SkillConfigName = skill.ConfigName
-			entry.LastSyncedAt = time.Now()
-			localState.Entries[skill.Path] = entry
-			if err := statestore.Save(m.StatePath, localState); err != nil {
-				return report, err
-			}
-			if err := client.SetEnabled(skill.Path, skill.ConfigName, false); err != nil {
-				change.Message = err.Error()
-				report.Conflicts++
-				report.Changes = append(report.Changes, change)
-				continue
-			}
-		} else {
-			if !skill.Enabled {
-				if client == nil {
-					change.Message = "Codex app-server is required to re-enable a skill"
-					report.Conflicts++
-					report.Changes = append(report.Changes, change)
-					continue
-				}
-				entry.ManagedEnabled = true
-				entry.SkillConfigName = skill.ConfigName
-				entry.LastSyncedAt = time.Now()
-				localState.Entries[skill.Path] = entry
-				if err := statestore.Save(m.StatePath, localState); err != nil {
-					return report, err
-				}
-				if err := client.SetEnabled(skill.Path, skill.ConfigName, true); err != nil {
-					change.Message = err.Error()
-					report.Conflicts++
-					report.Changes = append(report.Changes, change)
-					continue
-				}
-			}
-			allow := desired == model.StateImplicit
-			entry.ManagedPolicy = true
-			entry.LastSyncedAt = time.Now()
-			localState.Entries[skill.Path] = entry
-			if err := statestore.Save(m.StatePath, localState); err != nil {
-				return report, err
-			}
-			hash, err := policy.Set(skill.PolicyPath, allow)
-			if err != nil {
-				change.Message = err.Error()
-				report.Conflicts++
-				report.Changes = append(report.Changes, change)
-				continue
-			}
-			entry.LastManagedHash = hash
-		}
-		entry.LastSyncedAt = time.Now()
 		localState.Entries[skill.Path] = entry
-		if err := statestore.Save(m.StatePath, localState); err != nil {
+		if err := statestore.Save(m.StatePath(), localState); err != nil {
+			return report, err
+		}
+		entry, applyErr := active.Apply(skill, desired, entry)
+		if applyErr != nil {
+			change.Reason = applyErr.Error()
+			report.Conflicts++
+			report.Skipped++
+			report.Changes = append(report.Changes, change)
+			report.ConflictedChanges = append(report.ConflictedChanges, change)
+			continue
+		}
+		localState.Entries[skill.Path] = entry
+		if err := statestore.Save(m.StatePath(), localState); err != nil {
 			return report, err
 		}
 		change.Applied = true
 		report.Changes = append(report.Changes, change)
+		report.AppliedChanges = append(report.AppliedChanges, change)
 	}
 	if report.Conflicts > 0 {
 		return report, fmt.Errorf("%d skill changes could not be applied", report.Conflicts)
@@ -380,109 +383,50 @@ func (m Manager) Sync(ctx context.Context, options SyncOptions) (model.SyncRepor
 	return report, nil
 }
 
-func (m Manager) Restore(ctx context.Context, selectors []string, all, dryRun bool) (RestoreReport, error) {
-	report := RestoreReport{DryRun: dryRun}
-	localState, err := statestore.LoadOrDefault(m.StatePath)
+func (m Manager) Restore(ctx context.Context, selectors []string, all, dryRun, project bool) (RestoreReport, error) {
+	report := RestoreReport{Agent: m.Agent, DryRun: dryRun}
+	localState, err := statestore.LoadOrDefault(m.StatePath(), m.Agent)
 	if err != nil {
 		return report, err
 	}
 	if len(localState.Entries) == 0 {
 		return report, nil
 	}
-	selected := map[string]bool{}
-	if !all {
-		for _, selector := range selectors {
-			selected[selector] = true
-		}
+	cfg, _, err := config.LoadOrDefault(m.ConfigPath)
+	if err != nil {
+		return report, err
 	}
-	var client codexSession
-	needClient := false
-	needPluginVerification := false
-	for _, entry := range localState.Entries {
-		matches := all || selected[entry.SkillID] || selected[entry.SkillPath]
-		if !matches {
-			continue
-		}
-		needClient = needClient || (!dryRun && entry.ManagedEnabled)
-		needPluginVerification = needPluginVerification || stateEntryIsPlugin(entry)
+	active, err := m.openAdapter(cfg)
+	if err != nil {
+		return report, err
 	}
-	var installed codex.InstalledPlugins
-	if needClient || needPluginVerification {
-		cfg, _, loadErr := config.LoadOrDefault(m.ConfigPath)
-		if loadErr != nil {
-			return report, loadErr
-		}
-		client, err = m.openCodexSession(ctx, cfg.Adapters.Codex.Command)
-		if err != nil {
-			if needPluginVerification {
-				return report, &InventoryUnavailableError{Status: model.DiscoveryPartialFailure, Reason: err.Error()}
-			}
-			return report, err
-		}
-		defer client.Close()
-		if needPluginVerification {
-			installed, _, err = client.ListInstalledPlugins(m.CWD)
-			if err != nil {
-				status := model.DiscoveryPartialFailure
-				reason := err.Error()
-				if codex.IsMethodNotFound(err) {
-					status = model.DiscoveryPartialUnsupported
-					reason = pluginDiscoveryUpgradeMessage
-				}
-				return report, &InventoryUnavailableError{Status: status, Reason: reason}
-			}
-		}
+	defer active.Close()
+	if _, _, err := active.Discover(ctx); err != nil {
+		return report, err
 	}
+	selected := selectionSet(selectors)
 	for key, entry := range localState.Entries {
 		if !all && !selected[entry.SkillID] && !selected[entry.SkillPath] {
 			continue
 		}
-		if stateEntryIsPlugin(entry) {
-			pluginID := stateEntryPluginID(entry)
-			plugin, ok := installed.LookupID(pluginID)
-			if !ok || !plugin.Installed || !plugin.Enabled {
-				report.Conflicts = append(report.Conflicts, entry.SkillID+": plugin installation is not active and verified")
-				continue
-			}
-			if !codex.PluginOwnsPath(plugin, entry.SkillPath, m.codexPluginCacheRoot()) {
-				report.Conflicts = append(report.Conflicts, entry.SkillID+": restore snapshot does not belong to the active plugin package")
-				continue
-			}
+		if entry.Scope == model.ScopeRepo && !project {
+			report.Conflicts = append(report.Conflicts, entry.SkillID+": project restore requires --project")
+			continue
 		}
-		if entry.ManagedPolicy && entry.LastManagedHash != "" {
-			currentHash, hashErr := fileutil.HashFile(entry.PolicyPath)
-			if hashErr != nil && !errors.Is(hashErr, os.ErrNotExist) {
-				report.Conflicts = append(report.Conflicts, entry.SkillID+": "+hashErr.Error())
-				continue
-			}
-			if currentHash != entry.LastManagedHash {
-				report.Conflicts = append(report.Conflicts, entry.SkillID+": policy file changed outside skillctl")
-				continue
-			}
+		if err := active.CheckRestore(entry); err != nil {
+			report.Conflicts = append(report.Conflicts, entry.SkillID+": "+err.Error())
+			continue
 		}
 		if dryRun {
 			report.Restored = append(report.Restored, entry.SkillID)
 			continue
 		}
-		if entry.ManagedEnabled {
-			if err := client.SetEnabled(entry.SkillPath, entry.SkillConfigName, entry.OriginalEnabled); err != nil {
-				report.Conflicts = append(report.Conflicts, entry.SkillID+": "+err.Error())
-				continue
-			}
-		}
-		if entry.ManagedPolicy {
-			_, err := policy.Restore(entry.PolicyPath, policy.Snapshot{
-				FileExisted: entry.PolicyFileExisted,
-				Present:     entry.OriginalPolicyPresent,
-				Value:       entry.OriginalPolicyValue,
-			})
-			if err != nil {
-				report.Conflicts = append(report.Conflicts, entry.SkillID+": "+err.Error())
-				continue
-			}
+		if err := active.Restore(entry); err != nil {
+			report.Conflicts = append(report.Conflicts, entry.SkillID+": "+err.Error())
+			continue
 		}
 		delete(localState.Entries, key)
-		if err := statestore.Save(m.StatePath, localState); err != nil {
+		if err := statestore.Save(m.StatePath(), localState); err != nil {
 			return report, err
 		}
 		report.Restored = append(report.Restored, entry.SkillID)
@@ -490,171 +434,50 @@ func (m Manager) Restore(ctx context.Context, selectors []string, all, dryRun bo
 	if !all && len(report.Restored) == 0 && len(report.Conflicts) == 0 {
 		return report, errors.New("no managed state matched the requested selector")
 	}
+	sort.Strings(report.Restored)
 	if len(report.Conflicts) > 0 {
 		return report, fmt.Errorf("%d restore conflicts", len(report.Conflicts))
 	}
-	sort.Strings(report.Restored)
 	return report, nil
 }
 
-func (m Manager) discover(ctx context.Context, cfg config.Config) ([]model.Skill, model.DiscoveryReport, codexSession, error) {
-	report := model.DiscoveryReport{Status: model.DiscoveryComplete}
-	client, openErr := m.openCodexSession(ctx, cfg.Adapters.Codex.Command)
-	if openErr != nil {
-		report.Status = model.DiscoveryPartialFailure
-		report.Warnings = append(report.Warnings, model.DiscoveryWarning{
-			Code:    "plugin_discovery_failed",
-			Message: "Codex app-server unavailable; plugin inventory omitted: " + openErr.Error(),
-		})
-		skills, err := m.partialFilesystemInventory(&report)
-		return skills, report, nil, err
-	}
-
-	installed, installedWarnings, installedErr := client.ListInstalledPlugins(m.CWD)
-	appendStringWarnings(&report, "plugin_marketplace_warning", installedWarnings)
-	if installedErr != nil {
-		if codex.IsMethodNotFound(installedErr) {
-			report.Status = model.DiscoveryPartialUnsupported
-			report.Warnings = append(report.Warnings, model.DiscoveryWarning{
-				Code:    "plugin_discovery_unsupported",
-				Message: pluginDiscoveryUpgradeMessage,
-			})
-		} else {
-			report.Status = model.DiscoveryPartialFailure
-			report.Warnings = append(report.Warnings, model.DiscoveryWarning{
-				Code:    "plugin_discovery_failed",
-				Message: "Codex installed-plugin discovery failed; plugin inventory omitted: " + installedErr.Error(),
-			})
+func (m Manager) DeleteSkill(skill model.Skill, project bool) error {
+	if m.Agent == "" {
+		m.Agent = skill.Agent
+		if m.Agent == "" {
+			m.Agent = model.AgentCodex
 		}
-		appSkills, skillWarnings, skillsErr := client.DiscoverSkills(m.CWD)
-		appendStringWarnings(&report, "skill_discovery_warning", skillWarnings)
-		if skillsErr != nil {
-			report.Warnings = append(report.Warnings, model.DiscoveryWarning{Code: "skill_discovery_failed", Message: skillsErr.Error()})
-			appSkills = nil
-		}
-		filesystemSkills, filesystemErr := m.partialFilesystemInventory(&report)
-		if filesystemErr != nil {
-			client.Close()
-			return nil, report, nil, filesystemErr
-		}
-		return mergeNonPluginSkills(appSkills, filesystemSkills), report, client, nil
 	}
-
-	appSkills, skillWarnings, skillsErr := client.DiscoverSkills(m.CWD)
-	appendStringWarnings(&report, "skill_discovery_warning", skillWarnings)
-	if skillsErr != nil {
-		report.Status = model.DiscoveryPartialFailure
-		report.Warnings = append(report.Warnings, model.DiscoveryWarning{Code: "skill_discovery_failed", Message: skillsErr.Error()})
-		filesystemSkills, filesystemErr := m.partialFilesystemInventory(&report)
-		if filesystemErr != nil {
-			client.Close()
-			return nil, report, nil, filesystemErr
-		}
-		return filesystemSkills, report, client, nil
+	if skill.Agent != "" && skill.Agent != m.Agent {
+		return fmt.Errorf("%s belongs to %s, not the active %s Agent", skill.ID, skill.Agent, m.Agent)
 	}
-
-	filesystemSkills, filesystemWarnings, filesystemErr := m.filesystemSkills()
-	appendStringWarnings(&report, "filesystem_warning", filesystemWarnings)
-	if filesystemErr != nil {
-		report.Warnings = append(report.Warnings, model.DiscoveryWarning{Code: "filesystem_discovery_failed", Message: filesystemErr.Error()})
-		filesystemSkills = nil
+	if skill.ReadOnly {
+		return fmt.Errorf("%s is read-only: shadowed by %s", skill.ID, skill.BlockedBy)
 	}
-	supplements, supplementWarnings := codex.DiscoverPluginSupplements(installed, m.codexPluginCacheRoot())
-	report.Warnings = append(report.Warnings, supplementWarnings...)
-	skills := reconcileInventory(appSkills, filesystemSkills, supplements, installed, m.codexPluginCacheRoot())
-	return skills, report, client, nil
-}
-
-func (m Manager) openCodexSession(ctx context.Context, command string) (codexSession, error) {
-	if m.openCodex != nil {
-		return m.openCodex(ctx, command, m.CWD)
+	if skill.Scope == model.ScopeRepo && !project {
+		return errors.New("project skills require --project")
 	}
-	return codex.Open(ctx, command, m.CWD)
-}
-
-func (m Manager) filesystemSkills() ([]model.Skill, []string, error) {
-	if m.discoverFilesystem != nil {
-		return m.discoverFilesystem(m.CWD)
-	}
-	return codex.DiscoverFilesystem(m.CWD)
-}
-
-func (m Manager) codexPluginCacheRoot() string {
-	if m.pluginCacheRoot != "" {
-		return m.pluginCacheRoot
-	}
-	home, err := os.UserHomeDir()
+	cfg, _, err := config.LoadOrDefault(m.ConfigPath)
 	if err != nil {
-		return ""
+		return err
 	}
-	return filepath.Join(home, ".codex", "plugins", "cache")
+	active, err := m.openAdapter(cfg)
+	if err != nil {
+		return err
+	}
+	defer active.Close()
+	return active.Delete(skill)
 }
 
-func (m Manager) partialFilesystemInventory(report *model.DiscoveryReport) ([]model.Skill, error) {
-	skills, warnings, err := m.filesystemSkills()
-	appendStringWarnings(report, "filesystem_warning", warnings)
+func (m Manager) openAdapter(cfg config.Config) (adapter.Adapter, error) {
+	if !m.Agent.Valid() {
+		return nil, errors.New("an active Agent is required")
+	}
+	value, err := cfg.Agent(m.Agent)
 	if err != nil {
 		return nil, err
 	}
-	return nonPluginSkills(skills), nil
-}
-
-func reconcileInventory(primary, filesystem, supplements []model.Skill, installed codex.InstalledPlugins, cacheRoot string) []model.Skill {
-	primary = eligibleSkills(primary, installed, cacheRoot)
-	filesystem = nonPluginSkills(filesystem)
-	seenPath := map[string]bool{}
-	seenID := map[string]bool{}
-	result := make([]model.Skill, 0, len(primary)+len(filesystem)+len(supplements))
-	for _, skill := range append(append(primary, supplements...), filesystem...) {
-		if seenPath[skill.Path] || seenID[skill.ID] {
-			continue
-		}
-		seenPath[skill.Path] = true
-		seenID[skill.ID] = true
-		result = append(result, skill)
-	}
-	sort.Slice(result, func(i, j int) bool { return result[i].ID < result[j].ID })
-	return result
-}
-
-func eligibleSkills(skills []model.Skill, installed codex.InstalledPlugins, cacheRoot string) []model.Skill {
-	result := make([]model.Skill, 0, len(skills))
-	for _, skill := range skills {
-		if skill.Scope != model.ScopePlugin {
-			result = append(result, skill)
-			continue
-		}
-		plugin, ok := installed.LookupSource(skill.Source)
-		if !ok || !plugin.Installed || !plugin.Enabled {
-			continue
-		}
-		if !codex.PluginOwnsPath(plugin, skill.Path, cacheRoot) {
-			continue
-		}
-		skill.PluginID = plugin.ID
-		result = append(result, skill)
-	}
-	return result
-}
-
-func nonPluginSkills(skills []model.Skill) []model.Skill {
-	result := make([]model.Skill, 0, len(skills))
-	for _, skill := range skills {
-		if skill.Scope != model.ScopePlugin {
-			result = append(result, skill)
-		}
-	}
-	return result
-}
-
-func mergeNonPluginSkills(primary, secondary []model.Skill) []model.Skill {
-	return reconcileInventory(nonPluginSkills(primary), secondary, nil, codex.InstalledPlugins{}, "")
-}
-
-func appendStringWarnings(report *model.DiscoveryReport, code string, warnings []string) {
-	for _, warning := range warnings {
-		report.Warnings = append(report.Warnings, model.DiscoveryWarning{Code: code, Message: warning})
-	}
+	return adapter.New(m.Agent, value.Command, m.CWD)
 }
 
 type resolver struct {
@@ -679,43 +502,6 @@ func newResolver(skills []model.Skill) resolver {
 	return resolver{skills: skills, nameCount: counts}
 }
 
-func orphanRecords(profile config.Profile, localState statestore.State, resolver resolver) []model.OrphanRecord {
-	var result []model.OrphanRecord
-	policyGroups := []struct {
-		selectors []string
-		desired   model.InvocationState
-	}{
-		{selectors: profile.Implicit, desired: model.StateImplicit},
-		{selectors: profile.Disabled, desired: model.StateDisabled},
-	}
-	for _, group := range policyGroups {
-		for _, selector := range group.selectors {
-			if _, err := resolver.resolve(selector); err != nil {
-				var ambiguous ambiguousSelectorError
-				if errors.As(err, &ambiguous) {
-					continue
-				}
-				result = append(result, model.OrphanRecord{Kind: "policy", Selector: selector, Desired: group.desired})
-			}
-		}
-	}
-	for _, entry := range localState.Entries {
-		if _, err := resolver.resolve(entry.SkillID); err == nil {
-			continue
-		}
-		if _, err := resolver.resolve(entry.SkillPath); err == nil {
-			continue
-		}
-		result = append(result, model.OrphanRecord{Kind: "restore", SkillID: entry.SkillID, SkillPath: entry.SkillPath})
-	}
-	sort.Slice(result, func(i, j int) bool {
-		left := result[i].Kind + ":" + result[i].Selector + ":" + result[i].SkillID
-		right := result[j].Kind + ":" + result[j].Selector + ":" + result[j].SkillID
-		return left < right
-	})
-	return result
-}
-
 func (r resolver) resolve(selector string) (model.Skill, error) {
 	var matches []model.Skill
 	for _, skill := range r.skills {
@@ -737,10 +523,16 @@ func (r resolver) resolve(selector string) (model.Skill, error) {
 	return matches[0], nil
 }
 
-func (r resolver) desired(cfg config.Config, skill model.Skill) model.InvocationState {
-	profile := cfg.Active()
+func (r resolver) desired(cfg config.AgentConfig, skill model.Skill) model.InvocationState {
+	profile := cfg.Profiles[cfg.ActiveProfile]
 	if containsSelector(profile.Disabled, skill, r.nameCount) {
 		return model.StateDisabled
+	}
+	if containsSelector(profile.NameOnly, skill, r.nameCount) {
+		return model.StateNameOnly
+	}
+	if containsSelector(profile.Manual, skill, r.nameCount) {
+		return model.StateManual
 	}
 	if containsSelector(profile.Implicit, skill, r.nameCount) {
 		return model.StateImplicit
@@ -756,6 +548,8 @@ func (r resolver) validateProfile(profile config.Profile) ([]string, error) {
 		state     model.InvocationState
 	}{
 		{selectors: profile.Implicit, state: model.StateImplicit},
+		{selectors: profile.NameOnly, state: model.StateNameOnly},
+		{selectors: profile.Manual, state: model.StateManual},
 		{selectors: profile.Disabled, state: model.StateDisabled},
 	}
 	for _, group := range groups {
@@ -770,12 +564,51 @@ func (r resolver) validateProfile(profile config.Profile) ([]string, error) {
 				continue
 			}
 			if previous, ok := resolved[skill.ID]; ok && previous != group.state {
-				return warnings, fmt.Errorf("skill %s appears in both implicit and disabled policy lists", skill.ID)
+				return warnings, fmt.Errorf("skill %s appears in both %s and %s policy lists", skill.ID, previous, group.state)
 			}
 			resolved[skill.ID] = group.state
 		}
 	}
 	return warnings, nil
+}
+
+func orphanRecords(agent model.Agent, profile config.Profile, localState statestore.State, resolver resolver) []model.OrphanRecord {
+	var result []model.OrphanRecord
+	groups := []struct {
+		selectors []string
+		desired   model.InvocationState
+	}{
+		{selectors: profile.Implicit, desired: model.StateImplicit},
+		{selectors: profile.NameOnly, desired: model.StateNameOnly},
+		{selectors: profile.Manual, desired: model.StateManual},
+		{selectors: profile.Disabled, desired: model.StateDisabled},
+	}
+	for _, group := range groups {
+		for _, selector := range group.selectors {
+			if _, err := resolver.resolve(selector); err != nil {
+				var ambiguous ambiguousSelectorError
+				if errors.As(err, &ambiguous) {
+					continue
+				}
+				result = append(result, model.OrphanRecord{Agent: agent, Kind: "policy", Selector: selector, Desired: group.desired})
+			}
+		}
+	}
+	for _, entry := range localState.Entries {
+		if _, err := resolver.resolve(entry.SkillID); err == nil {
+			continue
+		}
+		if _, err := resolver.resolve(entry.SkillPath); err == nil {
+			continue
+		}
+		result = append(result, model.OrphanRecord{Agent: agent, Kind: "restore", SkillID: entry.SkillID, SkillPath: entry.SkillPath})
+	}
+	sort.Slice(result, func(i, j int) bool {
+		left := result[i].Kind + ":" + result[i].Selector + ":" + result[i].SkillID
+		right := result[j].Kind + ":" + result[j].Selector + ":" + result[j].SkillID
+		return left < right
+	})
+	return result
 }
 
 func containsSelector(selectors []string, skill model.Skill, counts map[string]int) bool {
@@ -788,7 +621,7 @@ func containsSelector(selectors []string, skill model.Skill, counts map[string]i
 }
 
 func matchesSelector(selector string, skill model.Skill, counts map[string]int) bool {
-	if selector == skill.ID || selector == skill.Path || selector == skill.ConfigName {
+	if selector == skill.ID || selector == skill.Path {
 		return true
 	}
 	if selector == skill.Name && counts[skill.Name] == 1 {
@@ -810,45 +643,18 @@ func selectionSet(selectors []string) map[string]bool {
 	return result
 }
 
-func partialSyncAllowed(options SyncOptions, skills []model.Skill) bool {
-	if !options.allowPartialNonPlugin || len(options.Selectors) == 0 {
-		return false
-	}
-	selected := selectionSet(options.Selectors)
-	found := map[string]bool{}
+func supportedInventory(agent model.Agent, skills []model.Skill) []model.Skill {
+	result := make([]model.Skill, 0, len(skills))
 	for _, skill := range skills {
-		if !selected[skill.ID] {
+		if skill.Agent != agent {
 			continue
 		}
-		if skill.Scope == model.ScopePlugin {
-			return false
+		if skill.Scope != model.ScopeUser && skill.Scope != model.ScopeRepo {
+			continue
 		}
-		found[skill.ID] = true
+		result = append(result, skill)
 	}
-	return len(found) == len(selected)
-}
-
-func inventoryUnavailable(discovery model.DiscoveryReport) error {
-	reason := "plugin installation state could not be verified"
-	if len(discovery.Warnings) > 0 {
-		reason = discovery.Warnings[0].Message
-	}
-	return &InventoryUnavailableError{Status: discovery.Status, Reason: reason}
-}
-
-func stateEntryIsPlugin(entry statestore.Entry) bool {
-	return entry.PluginID != "" || strings.HasPrefix(entry.SkillID, "codex:plugin:")
-}
-
-func stateEntryPluginID(entry statestore.Entry) string {
-	if entry.PluginID != "" {
-		return entry.PluginID
-	}
-	parts := strings.Split(entry.SkillID, ":")
-	if len(parts) >= 5 && parts[0] == "codex" && parts[1] == "plugin" {
-		return parts[3] + "@" + parts[2]
-	}
-	return ""
+	return result
 }
 
 func configHint(path string, err error) error {

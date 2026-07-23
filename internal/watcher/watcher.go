@@ -5,104 +5,201 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
-	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
+
+	"skillctl/internal/agent"
+	"skillctl/internal/claude"
+	"skillctl/internal/codex"
+	"skillctl/internal/config"
+	"skillctl/internal/model"
+	"skillctl/internal/skillfs"
+	statestore "skillctl/internal/state"
 )
 
 type Watcher struct {
-	ConfigPath string
-	StatePath  string
-	CWD        string
-	Interval   time.Duration
+	ConfigPath  string
+	StateDir    string
+	RuntimePath string
+	CWD         string
+	Interval    time.Duration
+	Project     bool
 }
 
-func (w Watcher) Run(ctx context.Context, sync func(context.Context) error) error {
+func (w Watcher) Run(ctx context.Context, sync func(context.Context, model.Agent) error) error {
 	if w.Interval <= 0 {
 		w.Interval = 5 * time.Second
 	}
-	if err := sync(ctx); err != nil {
+	var target model.Agent
+	var last string
+	syncTarget := func(next model.Agent) error {
+		target = next
+		if err := sync(ctx, target); err != nil {
+			last = ""
+			return nil
+		}
+		var err error
+		last, err = w.Fingerprint(target)
 		return err
 	}
-	last, err := w.Fingerprint()
-	if err != nil {
+	runCycle := func(force bool) error {
+		return w.withRuntimeLock(func() error {
+			next, err := w.Target()
+			if err != nil {
+				return err
+			}
+			current, err := w.Fingerprint(next)
+			if err != nil {
+				return err
+			}
+			if !force && next == target && current == last {
+				return nil
+			}
+			return syncTarget(next)
+		})
+	}
+	runTargetCycle := func() error {
+		return w.withRuntimeLock(func() error {
+			next, err := w.Target()
+			if err != nil || next == target {
+				return err
+			}
+			return syncTarget(next)
+		})
+	}
+	if err := runCycle(true); err != nil {
 		return err
 	}
 	ticker := time.NewTicker(w.Interval)
 	defer ticker.Stop()
+	targetTicker := time.NewTicker(100 * time.Millisecond)
+	defer targetTicker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
+		case <-targetTicker.C:
+			if err := runTargetCycle(); err != nil {
+				return err
+			}
 		case <-ticker.C:
-			current, err := w.Fingerprint()
-			if err != nil {
-				return err
-			}
-			if current == last {
-				continue
-			}
-			if err := sync(ctx); err != nil {
-				return err
-			}
-			last, err = w.Fingerprint()
-			if err != nil {
+			if err := runCycle(false); err != nil {
 				return err
 			}
 		}
 	}
 }
 
-func (w Watcher) Fingerprint() (string, error) {
-	home, err := os.UserHomeDir()
+func (w Watcher) Target() (model.Agent, error) {
+	runtimePath := w.runtimePath()
+	value, err := statestore.LoadRuntime(runtimePath)
 	if err != nil {
 		return "", err
 	}
-	roots := []string{
-		filepath.Join(home, ".agents", "skills"),
-		filepath.Join(home, ".codex", "skills"),
-		filepath.Join(home, ".codex", "plugins", "cache"),
+	if value.WatcherAgent.Valid() {
+		return value.WatcherAgent, nil
 	}
-	if w.CWD != "" {
-		roots = append(roots, filepath.Join(w.CWD, ".agents", "skills"))
+	cfg, _, err := config.LoadOrDefault(w.ConfigPath)
+	if err != nil {
+		return "", err
+	}
+	selected, err := agent.Detect(cfg, "")
+	if err != nil {
+		return "", err
+	}
+	value.WatcherAgent = selected
+	if err := statestore.SaveRuntime(runtimePath, value); err != nil {
+		return "", err
+	}
+	return selected, nil
+}
+
+func (w Watcher) SetTarget(target model.Agent) error {
+	if !target.Valid() {
+		return fmt.Errorf("invalid watcher Agent %q", target)
+	}
+	return w.withRuntimeLock(func() error {
+		path := w.runtimePath()
+		value, err := statestore.LoadRuntime(path)
+		if err != nil {
+			return err
+		}
+		value.WatcherAgent = target
+		return statestore.SaveRuntime(path, value)
+	})
+}
+
+func (w Watcher) Fingerprint(target model.Agent) (string, error) {
+	if !target.Valid() {
+		return "", fmt.Errorf("invalid watcher Agent %q", target)
+	}
+	var roots []skillfs.Root
+	var files []string
+	var err error
+	switch target {
+	case model.AgentCodex:
+		roots, err = codex.SupportedRoots(w.CWD)
+		if err != nil {
+			return "", err
+		}
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", err
+		}
+		files = append(files, filepath.Join(home, ".codex", "config.toml"))
+	case model.AgentClaude:
+		roots, err = claude.Roots(w.CWD)
+		if err != nil {
+			return "", err
+		}
+		paths, err := claude.Paths(w.CWD)
+		if err != nil {
+			return "", err
+		}
+		files = append(files, paths.User, paths.Shared, paths.Local)
+		files = append(files, paths.Managed...)
 	}
 	var records []string
 	for _, root := range roots {
-		err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
-			if walkErr != nil {
-				if os.IsNotExist(walkErr) {
-					return nil
-				}
-				return walkErr
+		if root.Scope == model.ScopeRepo && !w.Project {
+			continue
+		}
+		entries, readErr := os.ReadDir(root.Path)
+		if readErr != nil && !os.IsNotExist(readErr) {
+			return "", readErr
+		}
+		for _, entry := range entries {
+			if target == model.AgentCodex && entry.Name() == ".system" {
+				continue
 			}
-			if entry.IsDir() {
-				return nil
+			skillPath := filepath.Join(root.Path, entry.Name(), "SKILL.md")
+			if info, statErr := os.Stat(skillPath); statErr == nil && !info.IsDir() {
+				records = append(records, fileRecord(skillPath, info))
+			} else if statErr != nil && !os.IsNotExist(statErr) {
+				return "", statErr
 			}
-			clean := filepath.ToSlash(path)
-			if entry.Name() != "SKILL.md" && !strings.HasSuffix(clean, "/agents/openai.yaml") {
-				return nil
+			if target != model.AgentCodex {
+				continue
 			}
-			info, err := entry.Info()
-			if err != nil {
-				return err
+			policyPath := filepath.Join(root.Path, entry.Name(), "agents", "openai.yaml")
+			if info, statErr := os.Stat(policyPath); statErr == nil && !info.IsDir() {
+				records = append(records, fileRecord(policyPath, info))
+			} else if statErr != nil && !os.IsNotExist(statErr) {
+				return "", statErr
 			}
-			records = append(records, fmt.Sprintf("%s|%d|%d", path, info.Size(), info.ModTime().UnixNano()))
-			return nil
-		})
-		if err != nil && !os.IsNotExist(err) {
-			return "", err
 		}
 	}
-	files := []string{w.ConfigPath, w.StatePath, filepath.Join(home, ".codex", "config.toml")}
+	files = append(files, w.ConfigPath, statestore.Path(w.StateDir, target), w.runtimePath())
 	for _, path := range files {
 		if path == "" {
 			continue
 		}
 		if info, err := os.Stat(path); err == nil {
-			records = append(records, fmt.Sprintf("%s|%d|%d", path, info.Size(), info.ModTime().UnixNano()))
+			records = append(records, fileRecord(path, info))
 		} else if !os.IsNotExist(err) {
 			return "", err
 		}
@@ -110,4 +207,32 @@ func (w Watcher) Fingerprint() (string, error) {
 	sort.Strings(records)
 	sum := sha256.Sum256([]byte(strings.Join(records, "\n")))
 	return hex.EncodeToString(sum[:]), nil
+}
+
+func (w Watcher) runtimePath() string {
+	if w.RuntimePath != "" {
+		return w.RuntimePath
+	}
+	return statestore.RuntimePath(w.StateDir)
+}
+
+func (w Watcher) withRuntimeLock(run func() error) error {
+	path := w.runtimePath() + ".lock"
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX); err != nil {
+		return err
+	}
+	defer syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
+	return run()
+}
+
+func fileRecord(path string, info os.FileInfo) string {
+	return fmt.Sprintf("%s|%d|%d", path, info.Size(), info.ModTime().UnixNano())
 }

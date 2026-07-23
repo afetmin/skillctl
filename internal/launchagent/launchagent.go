@@ -19,11 +19,12 @@ const Label = "dev.skillctl.watch"
 type Definition struct {
 	Executable      string
 	ConfigPath      string
-	StatePath       string
+	StateDir        string
 	Interval        string
 	LogPath         string
 	WorkingDir      string
 	EnvironmentPath string
+	Project         bool
 }
 
 func Path() (string, error) {
@@ -123,9 +124,12 @@ func Render(definition Definition) ([]byte, error) {
 	arguments := []string{
 		definition.Executable,
 		"--config", definition.ConfigPath,
-		"--state-file", definition.StatePath,
+		"--state-dir", definition.StateDir,
 		"--cwd", definition.WorkingDir,
 		"watch", "--interval", definition.Interval,
+	}
+	if definition.Project {
+		arguments = append(arguments, "--project")
 	}
 	for _, argument := range arguments {
 		if err := encoder.EncodeElement(argument, xml.StartElement{Name: xml.Name{Local: "string"}}); err != nil {

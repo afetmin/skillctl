@@ -29,7 +29,7 @@ func TestDeleteSkillRemovesUserSkillDirectory(t *testing.T) {
 		Name:  "custom",
 		Path:  skillPath,
 		Scope: model.ScopeUser,
-	})
+	}, false)
 	if err != nil {
 		t.Fatalf("DeleteSkill() error = %v", err)
 	}
@@ -65,7 +65,7 @@ func TestDeleteSkillRemovesSymlinkWithoutDeletingTarget(t *testing.T) {
 		Name:  "shared",
 		Path:  filepath.Join(linkDir, "SKILL.md"),
 		Scope: model.ScopeUser,
-	})
+	}, false)
 	if err != nil {
 		t.Fatalf("DeleteSkill() error = %v", err)
 	}
@@ -82,10 +82,10 @@ func TestDeleteSkillRejectsProtectedScopes(t *testing.T) {
 	t.Setenv("HOME", home)
 
 	for _, scope := range []model.Scope{
-		model.ScopeSystem,
-		model.ScopePlugin,
-		model.ScopeAdmin,
-		model.ScopeOther,
+		model.Scope("system"),
+		model.Scope("plugin"),
+		model.Scope("admin"),
+		model.Scope("other"),
 	} {
 		t.Run(string(scope), func(t *testing.T) {
 			skillDir := filepath.Join(home, ".agents", "skills", string(scope))
@@ -101,7 +101,7 @@ func TestDeleteSkillRejectsProtectedScopes(t *testing.T) {
 				Name:  "protected",
 				Path:  skillPath,
 				Scope: scope,
-			})
+			}, false)
 			if err == nil {
 				t.Fatal("DeleteSkill() error = nil，期望拒绝删除受保护 Skill")
 			}
@@ -129,7 +129,7 @@ func TestDeleteSkillRejectsUserSkillOutsideKnownRoots(t *testing.T) {
 		Name:  "untrusted",
 		Path:  skillPath,
 		Scope: model.ScopeUser,
-	})
+	}, false)
 	if err == nil {
 		t.Fatal("DeleteSkill() error = nil，期望拒绝删除已知根目录之外的 Skill")
 	}
@@ -165,7 +165,7 @@ func TestDeleteSkillRejectsSymlinkAncestor(t *testing.T) {
 		Name:  "custom",
 		Path:  filepath.Join(linkedParent, "custom", "SKILL.md"),
 		Scope: model.ScopeUser,
-	})
+	}, false)
 	if err == nil {
 		t.Fatal("DeleteSkill() error = nil，期望拒绝穿过上级符号链接删除")
 	}
@@ -189,7 +189,7 @@ func TestDeleteSkillRemovesProjectSkillDirectory(t *testing.T) {
 		Name:  "project-skill",
 		Path:  skillPath,
 		Scope: model.ScopeRepo,
-	})
+	}, true)
 	if err != nil {
 		t.Fatalf("DeleteSkill() error = %v", err)
 	}
@@ -219,7 +219,7 @@ func TestDeleteSkillRejectsSymlinkInsideConfiguredRootPath(t *testing.T) {
 		Name:  "custom",
 		Path:  filepath.Join(home, ".agents", "skills", "custom", "SKILL.md"),
 		Scope: model.ScopeUser,
-	})
+	}, false)
 	if err == nil {
 		t.Fatal("DeleteSkill() error = nil，期望拒绝穿过 Skill 根路径中的符号链接")
 	}

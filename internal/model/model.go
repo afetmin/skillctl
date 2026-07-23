@@ -2,32 +2,55 @@ package model
 
 import "time"
 
+type Agent string
+
+const (
+	AgentCodex  Agent = "codex"
+	AgentClaude Agent = "claude"
+)
+
+func (a Agent) Valid() bool {
+	return a == AgentCodex || a == AgentClaude
+}
+
 type InvocationState string
 
 const (
 	StateImplicit InvocationState = "implicit"
+	StateNameOnly InvocationState = "name-only"
 	StateManual   InvocationState = "manual"
 	StateDisabled InvocationState = "disabled"
 )
 
 func (s InvocationState) Valid() bool {
 	switch s {
-	case StateImplicit, StateManual, StateDisabled:
+	case StateImplicit, StateNameOnly, StateManual, StateDisabled:
 		return true
 	default:
 		return false
 	}
 }
 
+func ValidState(agent Agent, state InvocationState) bool {
+	if !state.Valid() {
+		return false
+	}
+	return agent == AgentClaude || state != StateNameOnly
+}
+
+func States(agent Agent) []InvocationState {
+	states := []InvocationState{StateImplicit}
+	if agent == AgentClaude {
+		states = append(states, StateNameOnly)
+	}
+	return append(states, StateManual, StateDisabled)
+}
+
 type Scope string
 
 const (
-	ScopeUser   Scope = "user"
-	ScopePlugin Scope = "plugin"
-	ScopeRepo   Scope = "repo"
-	ScopeSystem Scope = "system"
-	ScopeAdmin  Scope = "admin"
-	ScopeOther  Scope = "other"
+	ScopeUser Scope = "user"
+	ScopeRepo Scope = "repo"
 )
 
 type DiscoveryStatus string
@@ -39,9 +62,8 @@ const (
 )
 
 type DiscoveryWarning struct {
-	Code     string `json:"code"`
-	Message  string `json:"message"`
-	PluginID string `json:"plugin_id,omitempty"`
+	Code    string `json:"code"`
+	Message string `json:"message"`
 }
 
 type DiscoveryReport struct {
@@ -54,21 +76,27 @@ func (r DiscoveryReport) Complete() bool {
 }
 
 type Skill struct {
-	ID          string   `json:"id"`
-	Name        string   `json:"name"`
-	Description string   `json:"description,omitempty"`
-	Path        string   `json:"path"`
-	Scope       Scope    `json:"scope"`
-	Source      string   `json:"source"`
-	Enabled     bool     `json:"enabled"`
-	Policy      *bool    `json:"allow_implicit_invocation,omitempty"`
-	PolicyPath  string   `json:"policy_path"`
-	ConfigName  string   `json:"-"`
-	PluginID    string   `json:"plugin_id,omitempty"`
-	Aliases     []string `json:"-"`
+	Agent       Agent           `json:"agent"`
+	ID          string          `json:"id"`
+	Name        string          `json:"name"`
+	Description string          `json:"description,omitempty"`
+	Path        string          `json:"path"`
+	Scope       Scope           `json:"scope"`
+	Source      string          `json:"source"`
+	Enabled     bool            `json:"enabled"`
+	Policy      *bool           `json:"allow_implicit_invocation,omitempty"`
+	PolicyPath  string          `json:"policy_path"`
+	Aliases     []string        `json:"-"`
+	NativeState InvocationState `json:"-"`
+	ReadOnly    bool            `json:"read_only,omitempty"`
+	Shadowed    bool            `json:"shadowed,omitempty"`
+	BlockedBy   string          `json:"blocked_by,omitempty"`
 }
 
 func (s Skill) ActualState() InvocationState {
+	if s.NativeState.Valid() {
+		return s.NativeState
+	}
 	if !s.Enabled {
 		return StateDisabled
 	}
@@ -79,34 +107,40 @@ func (s Skill) ActualState() InvocationState {
 }
 
 func (s Skill) ManagedByDefault() bool {
-	return s.Scope == ScopeUser || s.Scope == ScopePlugin
+	return s.Scope == ScopeUser && !s.ReadOnly
 }
 
 type Change struct {
+	Agent   Agent           `json:"agent"`
 	SkillID string          `json:"skill_id"`
 	Name    string          `json:"name"`
 	Path    string          `json:"path"`
 	From    InvocationState `json:"from"`
 	To      InvocationState `json:"to"`
 	Applied bool            `json:"applied"`
-	Message string          `json:"message,omitempty"`
+	Reason  string          `json:"reason,omitempty"`
 }
 
 type SyncReport struct {
-	Scanned   int                `json:"scanned"`
-	Managed   int                `json:"managed"`
-	Changed   int                `json:"changed"`
-	Skipped   int                `json:"skipped"`
-	Conflicts int                `json:"conflicts"`
-	DryRun    bool               `json:"dry_run"`
-	Changes   []Change           `json:"changes"`
-	Warnings  []DiscoveryWarning `json:"warnings,omitempty"`
-	Discovery DiscoveryReport    `json:"discovery"`
-	Orphans   []OrphanRecord     `json:"orphans,omitempty"`
-	At        time.Time          `json:"at"`
+	Agent             Agent              `json:"agent"`
+	Scanned           int                `json:"scanned"`
+	Managed           int                `json:"managed"`
+	Changed           int                `json:"changed"`
+	Skipped           int                `json:"skipped"`
+	Conflicts         int                `json:"conflicts"`
+	DryRun            bool               `json:"dry_run"`
+	Changes           []Change           `json:"changes"`
+	AppliedChanges    []Change           `json:"applied_changes,omitempty"`
+	SkippedChanges    []Change           `json:"skipped_changes,omitempty"`
+	ConflictedChanges []Change           `json:"conflicted_changes,omitempty"`
+	Warnings          []DiscoveryWarning `json:"warnings,omitempty"`
+	Discovery         DiscoveryReport    `json:"discovery"`
+	Orphans           []OrphanRecord     `json:"orphans,omitempty"`
+	At                time.Time          `json:"at"`
 }
 
 type OrphanRecord struct {
+	Agent     Agent           `json:"agent"`
 	Kind      string          `json:"kind"`
 	Selector  string          `json:"selector,omitempty"`
 	SkillID   string          `json:"skill_id,omitempty"`

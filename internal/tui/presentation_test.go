@@ -8,14 +8,14 @@ import (
 	"skillctl/internal/service"
 )
 
-func TestHeaderShowsUnavailablePluginStatus(t *testing.T) {
+func TestHeaderShowsIncompleteStateVerification(t *testing.T) {
 	m := uiModel{
 		width:     120,
 		discovery: model.DiscoveryReport{Status: model.DiscoveryPartialUnsupported},
 		pending:   map[string]pendingChange{},
 		applied:   map[string]bool{},
 	}
-	if header := m.headerView(); !strings.Contains(header, "plugin status unavailable") {
+	if header := m.headerView(); !strings.Contains(header, "state verification incomplete") {
 		t.Fatalf("header = %q", header)
 	}
 }

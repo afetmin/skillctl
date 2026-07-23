@@ -14,7 +14,7 @@ func TestBeginDeleteOpensConfirmationForDeletableSkill(t *testing.T) {
 		Name:  "custom",
 		Path:  "/tmp/custom/SKILL.md",
 		Scope: model.ScopeUser,
-	}}
+	}, Managed: true}
 	m := uiModel{
 		rows:     []tableRow{{Kind: rowSkill, Skill: skill}},
 		rowIndex: 0,

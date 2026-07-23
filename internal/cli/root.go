@@ -17,6 +17,7 @@ import (
 	"github.com/charmbracelet/x/term"
 	"github.com/spf13/cobra"
 
+	"skillctl/internal/agent"
 	"skillctl/internal/config"
 	"skillctl/internal/inventory"
 	"skillctl/internal/launchagent"
@@ -43,8 +44,9 @@ func (e *ExitError) Error() string {
 
 type options struct {
 	configPath string
-	statePath  string
+	stateDir   string
 	cwd        string
+	agent      string
 	json       bool
 }
 
@@ -69,7 +71,7 @@ func newRoot() (*cobra.Command, error) {
 	if err != nil {
 		return nil, err
 	}
-	statePath, err := statestore.DefaultPath()
+	stateDir, err := statestore.DefaultDir()
 	if err != nil {
 		return nil, err
 	}
@@ -77,7 +79,7 @@ func newRoot() (*cobra.Command, error) {
 	if err != nil {
 		return nil, err
 	}
-	values := &options{configPath: configPath, statePath: statePath, cwd: cwd}
+	values := &options{configPath: configPath, stateDir: stateDir, cwd: cwd}
 	root := &cobra.Command{
 		Use:           "skillctl",
 		Short:         "Control which agent skills enter the model context",
@@ -92,8 +94,9 @@ func newRoot() (*cobra.Command, error) {
 		return &ExitError{Code: 2, Err: err}
 	})
 	root.PersistentFlags().StringVar(&values.configPath, "config", values.configPath, "configuration file")
-	root.PersistentFlags().StringVar(&values.statePath, "state-file", values.statePath, "local state file")
+	root.PersistentFlags().StringVar(&values.stateDir, "state-dir", values.stateDir, "local state directory")
 	root.PersistentFlags().StringVarP(&values.cwd, "cwd", "C", values.cwd, "working directory used for skill discovery")
+	root.PersistentFlags().StringVar(&values.agent, "agent", "", "target Agent for this command: codex or claude")
 	root.PersistentFlags().BoolVar(&values.json, "json", false, "emit machine-readable JSON")
 
 	root.AddCommand(
@@ -103,6 +106,7 @@ func newRoot() (*cobra.Command, error) {
 		newStatusCommand(values),
 		newSetCommand(values),
 		newStateAliasCommand(values, "allow", model.StateImplicit),
+		newStateAliasCommand(values, "name-only", model.StateNameOnly),
 		newStateAliasCommand(values, "manual", model.StateManual),
 		newStateAliasCommand(values, "disable", model.StateDisabled),
 		newSyncCommand(values),
@@ -146,7 +150,10 @@ func runTUI(ctx context.Context, values *options, project bool) error {
 	if !term.IsTerminal(os.Stdin.Fd()) || !term.IsTerminal(os.Stdout.Fd()) {
 		return &ExitError{Code: 2, Err: errors.New("interactive terminal required; use skillctl list or skillctl list --json")}
 	}
-	manager := values.manager()
+	manager, err := values.manager()
+	if err != nil {
+		return err
+	}
 	if _, exists, err := config.LoadOrDefault(manager.ConfigPath); err != nil {
 		return err
 	} else if !exists {
@@ -154,11 +161,28 @@ func runTUI(ctx context.Context, values *options, project bool) error {
 			return err
 		}
 	}
-	return tui.Run(ctx, tui.Options{Manager: manager, Project: project})
+	cfg, _, err := config.LoadOrDefault(manager.ConfigPath)
+	if err != nil {
+		return err
+	}
+	return tui.Run(ctx, tui.Options{
+		Manager:     manager,
+		Agents:      agent.Available(cfg),
+		Project:     project,
+		RuntimePath: statestore.RuntimePath(values.stateDir),
+	})
 }
 
-func (o *options) manager() service.Manager {
-	return service.Manager{ConfigPath: o.configPath, StatePath: o.statePath, CWD: o.cwd}
+func (o *options) manager() (service.Manager, error) {
+	cfg, _, err := config.LoadOrDefault(o.configPath)
+	if err != nil {
+		return service.Manager{}, err
+	}
+	selected, err := agent.Detect(cfg, o.agent)
+	if err != nil {
+		return service.Manager{}, err
+	}
+	return service.Manager{Agent: selected, ConfigPath: o.configPath, StateDir: o.stateDir, CWD: o.cwd}, nil
 }
 
 func newInitCommand(values *options) *cobra.Command {
@@ -169,7 +193,11 @@ func newInitCommand(values *options) *cobra.Command {
 		Short: "Create the private skillctl configuration",
 		Args:  noArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg, report, err := values.manager().Init(cmd.Context(), force, apply)
+			manager, err := values.manager()
+			if err != nil {
+				return err
+			}
+			cfg, report, err := manager.Init(cmd.Context(), force, apply)
 			if err != nil {
 				return err
 			}
@@ -177,7 +205,7 @@ func newInitCommand(values *options) *cobra.Command {
 				return printJSON(map[string]any{"config_path": values.configPath, "config": cfg, "sync": report})
 			}
 			fmt.Fprintf(cmd.OutOrStdout(), "Created %s\n", values.configPath)
-			fmt.Fprintln(cmd.OutOrStdout(), "Implicit whitelist is empty; user and plugin skills default to manual.")
+			fmt.Fprintln(cmd.OutOrStdout(), "Codex and Claude personal Skills default to manual; project Skills remain read-only.")
 			if report != nil {
 				printSync(cmd, *report)
 			} else {
@@ -203,7 +231,11 @@ func newListCommand(values *options) *cobra.Command {
 		Short:   "List discovered skills and their policy state",
 		Args:    noArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			items, discovery, err := values.manager().List(cmd.Context(), project)
+			manager, err := values.manager()
+			if err != nil {
+				return err
+			}
+			items, discovery, err := manager.List(cmd.Context(), project)
 			if err != nil {
 				return err
 			}
@@ -213,7 +245,7 @@ func newListCommand(values *options) *cobra.Command {
 			}
 			groups := inventory.GroupStatuses(inventory.Apply(items, filter))
 			if values.json {
-				return printJSON(map[string]any{"groups": groups, "warnings": discovery.Warnings, "discovery": discovery})
+				return printJSON(map[string]any{"agent": manager.Agent, "groups": groups, "warnings": discovery.Warnings, "discovery": discovery})
 			}
 			printGroups(cmd, groups)
 			printDiscoveryWarnings(cmd, discovery.Warnings)
@@ -221,9 +253,9 @@ func newListCommand(values *options) *cobra.Command {
 		},
 	}
 	command.Flags().BoolVar(&project, "project", false, "include project skills in management status")
-	command.Flags().StringVar(&state, "state", "", "filter by actual state: implicit, manual, or disabled")
+	command.Flags().StringVar(&state, "state", "", "filter by actual state")
 	command.Flags().BoolVar(&drift, "drift", false, "show only skills whose actual and desired states differ")
-	command.Flags().StringVar(&scope, "scope", "", "filter by scope: system, user, plugin, repo, admin, or other")
+	command.Flags().StringVar(&scope, "scope", "", "filter by scope: personal or project")
 	command.Flags().StringVar(&source, "source", "", "filter by source name")
 	return command
 }
@@ -235,16 +267,30 @@ func newStatusCommand(values *options) *cobra.Command {
 		Short: "Show one skill's current and desired state",
 		Args:  exactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			items, discovery, err := values.manager().List(cmd.Context(), project)
+			manager, err := values.manager()
 			if err != nil {
 				return err
+			}
+			items, discovery, err := manager.List(cmd.Context(), project)
+			if err != nil {
+				return err
+			}
+			if manager.Agent == model.AgentCodex && discovery.Status == model.DiscoveryPartialFailure {
+				if values.json {
+					if err := printJSON(map[string]any{"agent": manager.Agent, "warnings": discovery.Warnings, "discovery": discovery}); err != nil {
+						return err
+					}
+				} else {
+					printDiscoveryWarnings(cmd, discovery.Warnings)
+				}
+				return errors.New("Codex inventory is unavailable because enabled state could not be verified")
 			}
 			item, err := resolveStatus(items, args[0])
 			if err != nil {
 				return err
 			}
 			if values.json {
-				return printJSON(map[string]any{"skill": item, "warnings": discovery.Warnings, "discovery": discovery})
+				return printJSON(map[string]any{"agent": manager.Agent, "skill": item, "warnings": discovery.Warnings, "discovery": discovery})
 			}
 			fmt.Fprintf(cmd.OutOrStdout(), "ID:      %s\n", item.ID)
 			fmt.Fprintf(cmd.OutOrStdout(), "Actual:  %s\n", item.Actual)
@@ -263,7 +309,7 @@ func newSetCommand(values *options) *cobra.Command {
 	var noSync bool
 	var project bool
 	command := &cobra.Command{
-		Use:   "set <skill> <implicit|manual|disabled>",
+		Use:   "set <skill> <implicit|name-only|manual|disabled>",
 		Short: "Set and immediately apply a skill policy",
 		Args:  exactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -296,9 +342,16 @@ func runSet(cmd *cobra.Command, values *options, selector string, desired model.
 	if !desired.Valid() {
 		return &ExitError{Code: 2, Err: fmt.Errorf("invalid invocation state %q", desired)}
 	}
-	skill, report, err := values.manager().Set(cmd.Context(), selector, desired, noSync, project)
+	manager, managerErr := values.manager()
+	if managerErr != nil {
+		return managerErr
+	}
+	if !model.ValidState(manager.Agent, desired) {
+		return &ExitError{Code: 2, Err: fmt.Errorf("%s does not support invocation state %q", manager.Agent, desired)}
+	}
+	skill, report, err := manager.Set(cmd.Context(), selector, desired, noSync, project)
 	if values.json {
-		if printErr := printJSON(map[string]any{"skill": skill, "desired": desired, "sync": report, "error": errorString(err)}); printErr != nil {
+		if printErr := printJSON(map[string]any{"agent": manager.Agent, "skill": skill, "desired": desired, "sync": report, "error": errorString(err)}); printErr != nil {
 			return printErr
 		}
 	} else {
@@ -326,7 +379,11 @@ func newSyncCommand(values *options) *cobra.Command {
 		Short: "Reconcile installed skills with the active profile",
 		Args:  noArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			report, err := values.manager().Sync(cmd.Context(), service.SyncOptions{DryRun: dryRun, Project: project})
+			manager, managerErr := values.manager()
+			if managerErr != nil {
+				return managerErr
+			}
+			report, err := manager.Sync(cmd.Context(), service.SyncOptions{DryRun: dryRun, Project: project})
 			if values.json {
 				if printErr := printJSON(report); printErr != nil {
 					return printErr
@@ -355,7 +412,11 @@ func newDoctorCommand(values *options) *cobra.Command {
 		Short: "Check for policy drift without changing files",
 		Args:  noArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			report, err := values.manager().Sync(cmd.Context(), service.SyncOptions{DryRun: true, Project: project})
+			manager, managerErr := values.manager()
+			if managerErr != nil {
+				return managerErr
+			}
+			report, err := manager.Sync(cmd.Context(), service.SyncOptions{DryRun: true, Project: project})
 			if values.json {
 				if printErr := printJSON(report); printErr != nil {
 					return printErr
@@ -382,6 +443,7 @@ func newDoctorCommand(values *options) *cobra.Command {
 func newRestoreCommand(values *options) *cobra.Command {
 	var all bool
 	var dryRun bool
+	var project bool
 	command := &cobra.Command{
 		Use:   "restore [skill...]",
 		Short: "Restore policies captured before skillctl management",
@@ -392,16 +454,20 @@ func newRestoreCommand(values *options) *cobra.Command {
 			return nil
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
+			manager, managerErr := values.manager()
+			if managerErr != nil {
+				return managerErr
+			}
 			selectors := make([]string, 0, len(args))
 			for _, selector := range args {
-				skill, err := values.manager().Resolve(cmd.Context(), selector)
+				skill, err := manager.Resolve(cmd.Context(), selector)
 				if err != nil {
 					selectors = append(selectors, selector)
 					continue
 				}
 				selectors = append(selectors, skill.ID)
 			}
-			report, err := values.manager().Restore(cmd.Context(), selectors, all, dryRun)
+			report, err := manager.Restore(cmd.Context(), selectors, all, dryRun, project)
 			if values.json {
 				if printErr := printJSON(report); printErr != nil {
 					return printErr
@@ -425,11 +491,13 @@ func newRestoreCommand(values *options) *cobra.Command {
 	}
 	command.Flags().BoolVar(&all, "all", false, "restore every skill managed by skillctl")
 	command.Flags().BoolVar(&dryRun, "dry-run", false, "show what would be restored")
+	command.Flags().BoolVar(&project, "project", false, "allow restoring project Skill state")
 	return command
 }
 
 func newWatchCommand(values *options) *cobra.Command {
 	var interval time.Duration
+	var project bool
 	command := &cobra.Command{
 		Use:   "watch",
 		Short: "Watch installed skills and reconcile policy changes",
@@ -437,9 +505,17 @@ func newWatchCommand(values *options) *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 			defer stop()
-			watch := watcher.Watcher{ConfigPath: values.configPath, StatePath: values.statePath, CWD: values.cwd, Interval: interval}
-			return watch.Run(ctx, func(runContext context.Context) error {
-				report, err := values.manager().Sync(runContext, service.SyncOptions{})
+			watch := watcher.Watcher{
+				ConfigPath:  values.configPath,
+				StateDir:    values.stateDir,
+				RuntimePath: statestore.RuntimePath(values.stateDir),
+				CWD:         values.cwd,
+				Interval:    interval,
+				Project:     project,
+			}
+			return watch.Run(ctx, func(runContext context.Context, target model.Agent) error {
+				manager := service.Manager{Agent: target, ConfigPath: values.configPath, StateDir: values.stateDir, CWD: values.cwd}
+				report, err := manager.Sync(runContext, service.SyncOptions{Project: project})
 				if values.json {
 					if printErr := printJSON(report); printErr != nil {
 						return printErr
@@ -448,16 +524,20 @@ func newWatchCommand(values *options) *cobra.Command {
 					fmt.Fprintf(cmd.OutOrStdout(), "[%s] ", time.Now().Format(time.RFC3339))
 					printSync(cmd, report)
 				}
+				if err != nil {
+					fmt.Fprintf(cmd.ErrOrStderr(), "watch sync incomplete for %s: %v\n", target, err)
+				}
 				return err
 			})
 		},
 	}
 	command.PersistentFlags().DurationVar(&interval, "interval", 5*time.Second, "filesystem polling interval")
-	command.AddCommand(newWatchInstallCommand(values, &interval), newWatchUninstallCommand(values), newWatchStatusCommand(values))
+	command.PersistentFlags().BoolVar(&project, "project", false, "also manage project Skills")
+	command.AddCommand(newWatchInstallCommand(values, &interval, &project), newWatchUninstallCommand(values), newWatchStatusCommand(values))
 	return command
 }
 
-func newWatchInstallCommand(values *options, interval *time.Duration) *cobra.Command {
+func newWatchInstallCommand(values *options, interval *time.Duration, project *bool) *cobra.Command {
 	var dryRun bool
 	command := &cobra.Command{
 		Use:   "install",
@@ -476,14 +556,22 @@ func newWatchInstallCommand(values *options, interval *time.Duration) *cobra.Com
 			if err != nil {
 				return err
 			}
+			workingDir := home
+			if *project {
+				workingDir, err = filepath.Abs(values.cwd)
+				if err != nil {
+					return err
+				}
+			}
 			definition := launchagent.Definition{
 				Executable:      executable,
 				ConfigPath:      values.configPath,
-				StatePath:       values.statePath,
+				StateDir:        values.stateDir,
 				Interval:        interval.String(),
-				LogPath:         filepath.Join(filepath.Dir(values.statePath), "watch.log"),
-				WorkingDir:      home,
+				LogPath:         filepath.Join(values.stateDir, "watch.log"),
+				WorkingDir:      workingDir,
 				EnvironmentPath: os.Getenv("PATH"),
+				Project:         *project,
 			}
 			if dryRun {
 				data, renderErr := launchagent.Render(definition)
@@ -572,14 +660,16 @@ func resolveStatus(items []service.SkillStatus, selector string) (service.SkillS
 
 func printSync(cmd *cobra.Command, report model.SyncReport) {
 	mode := "applied"
+	count := len(report.AppliedChanges)
 	if report.DryRun {
 		mode = "planned"
+		count = max(0, report.Changed-report.Conflicts)
 	}
-	fmt.Fprintf(cmd.OutOrStdout(), "Scanned %d, managed %d, %s %d, conflicts %d.\n", report.Scanned, report.Managed, mode, report.Changed, report.Conflicts)
+	fmt.Fprintf(cmd.OutOrStdout(), "Agent %s: scanned %d, managed %d, %s %d, conflicts %d.\n", report.Agent, report.Scanned, report.Managed, mode, count, report.Conflicts)
 	for _, change := range report.Changes {
 		line := fmt.Sprintf("%s: %s -> %s", change.SkillID, change.From, change.To)
-		if change.Message != "" {
-			line += " (" + change.Message + ")"
+		if change.Reason != "" {
+			line += " (" + change.Reason + ")"
 		}
 		fmt.Fprintln(cmd.OutOrStdout(), line)
 	}
@@ -615,7 +705,11 @@ func printGroups(cmd *cobra.Command, groups []inventory.Group) {
 			fmt.Fprintln(cmd.OutOrStdout())
 		}
 		fmt.Fprintf(cmd.OutOrStdout(), "%s · %s\n", inventory.CategoryTitle(group.Category), group.Label)
-		fmt.Fprintln(cmd.OutOrStdout(), inventory.SummaryLine(group.Summary))
+		agent := model.AgentCodex
+		if len(group.Skills) > 0 {
+			agent = group.Skills[0].Agent
+		}
+		fmt.Fprintln(cmd.OutOrStdout(), inventory.SummaryLine(group.Summary, agent))
 		writer := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 4, 2, ' ', 0)
 		fmt.Fprintln(writer, "NAME\tACTUAL\tDESIRED\tMANAGED\tPATH")
 		for _, item := range group.Skills {
@@ -638,9 +732,11 @@ func listFilter(state, scope, source string, drift bool) (inventory.Filter, erro
 		}
 	}
 	if scope != "" {
-		filter.Scope = model.Scope(scope)
-		switch filter.Scope {
-		case model.ScopeSystem, model.ScopeUser, model.ScopePlugin, model.ScopeRepo, model.ScopeAdmin, model.ScopeOther:
+		switch scope {
+		case "personal":
+			filter.Scope = model.ScopeUser
+		case "project":
+			filter.Scope = model.ScopeRepo
 		default:
 			return inventory.Filter{}, fmt.Errorf("invalid scope %q", scope)
 		}

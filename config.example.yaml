@@ -1,11 +1,23 @@
-version: 1
-active_profile: default
-defaults:
-  invocation: manual
-profiles:
-  default:
-    implicit: []
-    disabled: []
-adapters:
+version: 2
+agents:
   codex:
     command: codex
+    active_profile: default
+    defaults:
+      invocation: manual
+    profiles:
+      default:
+        implicit: []
+        manual: []
+        disabled: []
+  claude:
+    command: claude
+    active_profile: default
+    defaults:
+      invocation: manual
+    profiles:
+      default:
+        implicit: []
+        name_only: []
+        manual: []
+        disabled: []

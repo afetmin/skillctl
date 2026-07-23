@@ -21,8 +21,10 @@ import (
 )
 
 type Options struct {
-	Manager service.Manager
-	Project bool
+	Manager     service.Manager
+	Agents      []model.Agent
+	Project     bool
+	RuntimePath string
 }
 
 type rowKind int
@@ -33,7 +35,8 @@ const (
 )
 
 const (
-	focusState = iota
+	focusAgent = iota
+	focusState
 	focusSource
 	focusTable
 )
@@ -45,6 +48,12 @@ const (
 const (
 	deleteChoiceCancel = iota
 	deleteChoiceConfirm
+)
+
+const (
+	switchChoiceCancel = iota
+	switchChoiceDiscard
+	switchChoiceApply
 )
 
 type tableRow struct {
@@ -90,6 +99,13 @@ type uiModel struct {
 	ctx     context.Context
 	manager service.Manager
 	project bool
+	agents  []model.Agent
+
+	agentIndex       int
+	switchConfirm    bool
+	switchChoice     int
+	switchTarget     model.Agent
+	switchAfterApply model.Agent
 
 	width  int
 	height int
@@ -150,6 +166,7 @@ type appliedMsg struct {
 type fingerprintMsg struct {
 	value string
 	err   error
+	agent model.Agent
 }
 
 type editorDoneMsg struct {
@@ -172,24 +189,40 @@ func Run(ctx context.Context, options Options) error {
 	spin.Spinner = spinner.Dot
 	spin.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("39"))
 
+	agents := append([]model.Agent(nil), options.Agents...)
+	if len(agents) == 0 {
+		agents = []model.Agent{options.Manager.Agent}
+	}
+	agentIndex := 0
+	for index, candidate := range agents {
+		if candidate == options.Manager.Agent {
+			agentIndex = index
+			break
+		}
+	}
 	initial := uiModel{
-		ctx:       ctx,
-		manager:   options.Manager,
-		project:   options.Project,
-		discovery: model.DiscoveryReport{Status: model.DiscoveryComplete},
-		states:    inventory.StateOptions(nil, inventory.Filter{}),
-		sources:   inventory.SourceOptions(nil, inventory.Filter{}),
-		collapsed: map[string]bool{},
-		pending:   map[string]pendingChange{},
-		applied:   map[string]bool{},
-		search:    search,
-		spinner:   spin,
-		loading:   true,
+		ctx:        ctx,
+		manager:    options.Manager,
+		project:    options.Project,
+		agents:     agents,
+		agentIndex: agentIndex,
+		focus:      focusAgent,
+		discovery:  model.DiscoveryReport{Status: model.DiscoveryComplete},
+		states:     inventory.StateOptions(nil, inventory.Filter{}, options.Manager.ValidStates()),
+		sources:    inventory.SourceOptions(nil, inventory.Filter{}),
+		collapsed:  map[string]bool{},
+		pending:    map[string]pendingChange{},
+		applied:    map[string]bool{},
+		search:     search,
+		spinner:    spin,
+		loading:    true,
 		watch: watcher.Watcher{
-			ConfigPath: options.Manager.ConfigPath,
-			StatePath:  options.Manager.StatePath,
-			CWD:        options.Manager.CWD,
-			Interval:   2 * time.Second,
+			ConfigPath:  options.Manager.ConfigPath,
+			StateDir:    options.Manager.StateDir,
+			RuntimePath: options.RuntimePath,
+			CWD:         options.Manager.CWD,
+			Interval:    2 * time.Second,
+			Project:     options.Project,
 		},
 	}
 	program := tea.NewProgram(
@@ -238,15 +271,35 @@ func (m uiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		m.confirm = false
 		m.confirmOffset = 0
 		if msg.err != nil {
-			m.status = msg.err.Error()
-			for id, change := range m.pending {
-				change.Conflict = true
-				m.pending[id] = change
+			m.switchAfterApply = ""
+			if m.applied == nil {
+				m.applied = map[string]bool{}
 			}
+			applied := make(map[string]bool, len(msg.report.AppliedChanges))
+			for _, change := range msg.report.AppliedChanges {
+				applied[change.SkillID] = true
+			}
+			remaining := make(map[string]pendingChange, len(m.pending))
+			for id, change := range m.pending {
+				if applied[id] {
+					m.applied[id] = true
+					continue
+				}
+				change.Conflict = true
+				remaining[id] = change
+			}
+			m.pending = remaining
+			m.status = fmt.Sprintf("Applied %d changes; %d conflicts remain; Agent not switched", len(applied), len(remaining))
 			return m, m.loadCmd()
 		}
 		conflicts := m.recordApplied()
-		m.status = fmt.Sprintf("Applied %d changes", msg.report.Changed)
+		if m.switchAfterApply.Valid() && conflicts == 0 {
+			target := m.switchAfterApply
+			m.switchAfterApply = ""
+			return m.completeAgentSwitch(target)
+		}
+		m.switchAfterApply = ""
+		m.status = fmt.Sprintf("Applied %d changes", len(msg.report.AppliedChanges))
 		if conflicts > 0 {
 			m.status += fmt.Sprintf("; %d conflicts remain", conflicts)
 		}
@@ -272,6 +325,9 @@ func (m uiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.loadCmd()
 	case fingerprintMsg:
 		commands = append(commands, m.fingerprintCmd())
+		if msg.agent != m.manager.Agent {
+			return m, tea.Batch(commands...)
+		}
 		if msg.err != nil {
 			m.status = "Auto-refresh: " + msg.err.Error()
 			return m, tea.Batch(commands...)
@@ -308,6 +364,9 @@ func (m uiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.help = true
 			return m, nil
 		}
+		if m.switchConfirm {
+			return m.updateSwitchConfirm(msg)
+		}
 		if m.deleteConfirm {
 			return m.updateDeleteConfirm(msg)
 		}
@@ -332,6 +391,8 @@ func (m uiModel) updateMain(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "shift+tab":
 		m.moveFocus(-1)
 		return m, nil
+	case "c":
+		return m.requestAgentSwitch(m.adjacentAgent(1))
 	case "/":
 		m.searching = true
 		return m, m.search.Focus()
@@ -361,6 +422,8 @@ func (m uiModel) updateMain(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "i":
 		return m.stageCurrent(model.StateImplicit), nil
+	case "n":
+		return m.stageCurrent(model.StateNameOnly), nil
 	case "m":
 		return m.stageCurrent(model.StateManual), nil
 	case "d":
@@ -370,6 +433,10 @@ func (m uiModel) updateMain(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "o":
 		return m, m.openEditorCmd()
 	case "enter":
+		if m.focus == focusAgent {
+			m.focus = focusState
+			return m, nil
+		}
 		if m.focus == focusState {
 			if leftWidth, _, _, _ := m.layout(); leftWidth == 0 {
 				m.focus = focusTable
@@ -409,14 +476,18 @@ func (m uiModel) updateMain(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case "left":
-		if m.focus == focusState {
+		if m.focus == focusAgent {
+			return m.requestAgentSwitch(m.adjacentAgent(-1))
+		} else if m.focus == focusState {
 			m.moveState(-1)
 		} else if m.focus == focusSource {
 			m.moveSource(-1)
 		}
 		return m, nil
 	case "right":
-		if m.focus == focusState {
+		if m.focus == focusAgent {
+			return m.requestAgentSwitch(m.adjacentAgent(1))
+		} else if m.focus == focusState {
 			m.moveState(1)
 		} else if m.focus == focusSource {
 			m.moveSource(1)
@@ -436,6 +507,10 @@ func (m uiModel) updateMain(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "home":
 		switch m.focus {
+		case focusAgent:
+			if len(m.agents) > 0 {
+				return m.requestAgentSwitch(m.agents[0])
+			}
 		case focusState:
 			m.stateIndex = 0
 			m.selectState()
@@ -449,6 +524,10 @@ func (m uiModel) updateMain(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "end":
 		switch m.focus {
+		case focusAgent:
+			if len(m.agents) > 0 {
+				return m.requestAgentSwitch(m.agents[len(m.agents)-1])
+			}
 		case focusState:
 			m.stateIndex = max(0, len(m.states)-1)
 			m.selectState()
@@ -465,9 +544,9 @@ func (m uiModel) updateMain(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m *uiModel) moveFocus(delta int) {
-	order := []int{focusState, focusSource, focusTable}
+	order := []int{focusAgent, focusState, focusSource, focusTable}
 	if leftWidth, _, _, _ := m.layout(); leftWidth == 0 {
-		order = []int{focusState, focusTable}
+		order = []int{focusAgent, focusState, focusTable}
 	}
 	current := 0
 	for index, focus := range order {
@@ -481,6 +560,106 @@ func (m *uiModel) moveFocus(delta int) {
 		next += len(order)
 	}
 	m.focus = order[next]
+}
+
+func (m uiModel) adjacentAgent(delta int) model.Agent {
+	if len(m.agents) == 0 {
+		return ""
+	}
+	index := (m.agentIndex + delta) % len(m.agents)
+	if index < 0 {
+		index += len(m.agents)
+	}
+	return m.agents[index]
+}
+
+func (m uiModel) requestAgentSwitch(target model.Agent) (tea.Model, tea.Cmd) {
+	if !target.Valid() || target == m.manager.Agent {
+		return m, nil
+	}
+	if m.loading || m.applying || m.deleting {
+		m.status = "Wait for the current operation to finish"
+		return m, nil
+	}
+	if len(m.pending) == 0 {
+		return m.completeAgentSwitch(target)
+	}
+	m.switchConfirm = true
+	m.switchChoice = switchChoiceCancel
+	m.switchTarget = target
+	return m, nil
+}
+
+func (m uiModel) updateSwitchConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc", "q":
+		m.switchConfirm = false
+		m.switchTarget = ""
+		m.switchChoice = switchChoiceCancel
+		return m, nil
+	case "left", "shift+tab":
+		m.switchChoice = (m.switchChoice + 2) % 3
+		return m, nil
+	case "right", "tab":
+		m.switchChoice = (m.switchChoice + 1) % 3
+		return m, nil
+	case "enter":
+		target := m.switchTarget
+		switch m.switchChoice {
+		case switchChoiceDiscard:
+			m.pending = map[string]pendingChange{}
+			m.switchConfirm = false
+			return m.completeAgentSwitch(target)
+		case switchChoiceApply:
+			m.switchConfirm = false
+			m.switchAfterApply = target
+			m.applying = true
+			m.status = "Applying pending changes before switching Agent"
+			return m, m.applyCmd()
+		default:
+			m.switchConfirm = false
+			m.switchTarget = ""
+			return m, nil
+		}
+	}
+	return m, nil
+}
+
+func (m uiModel) completeAgentSwitch(target model.Agent) (tea.Model, tea.Cmd) {
+	if err := m.watch.SetTarget(target); err != nil {
+		m.status = "Switch Agent: " + err.Error()
+		return m, nil
+	}
+	m.manager.Agent = target
+	for index, candidate := range m.agents {
+		if candidate == target {
+			m.agentIndex = index
+			break
+		}
+	}
+	m.switchConfirm = false
+	m.switchChoice = switchChoiceCancel
+	m.switchTarget = ""
+	m.switchAfterApply = ""
+	m.items = nil
+	m.groups = nil
+	m.rows = nil
+	m.pending = map[string]pendingChange{}
+	m.applied = map[string]bool{}
+	m.collapsed = map[string]bool{}
+	m.stateIndex = 0
+	m.sourceIndex = 0
+	m.sourceOffset = 0
+	m.rowIndex = 0
+	m.rowOffset = 0
+	m.states = inventory.StateOptions(nil, inventory.Filter{}, m.manager.ValidStates())
+	m.sources = inventory.SourceOptions(nil, inventory.Filter{})
+	m.discovery = model.DiscoveryReport{Status: model.DiscoveryComplete}
+	m.fingerprint = ""
+	m.loading = true
+	m.err = nil
+	m.status = "Switching to " + agentLabel(target)
+	return m, tea.Batch(m.loadCmd(), m.fingerprintCmd())
 }
 
 func (m uiModel) updateHelp(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -627,15 +806,15 @@ func (m uiModel) beginDelete() (tea.Model, tea.Cmd) {
 }
 
 func deleteBlockedReason(skill service.SkillStatus) string {
+	if !skill.Managed {
+		if skill.BlockedBy != "" {
+			return "Skill is read-only: " + skill.BlockedBy
+		}
+		return "Skill is read-only in the current project mode"
+	}
 	switch skill.Scope {
 	case model.ScopeUser, model.ScopeRepo:
 		return ""
-	case model.ScopeSystem:
-		return "System skills cannot be deleted"
-	case model.ScopePlugin:
-		return "Plugin skills cannot be deleted"
-	case model.ScopeAdmin:
-		return "Admin skills cannot be deleted"
 	default:
 		return "Skills from this source cannot be deleted"
 	}
@@ -711,6 +890,12 @@ func (m uiModel) handleMouse(event tea.MouseEvent) (tea.Model, tea.Cmd) {
 			m.detailOffset += 3
 		}
 		return m, nil
+	}
+	if event.Action == tea.MouseActionPress && event.Button == tea.MouseButtonLeft && event.Y == 0 {
+		if index := m.agentIndexAtX(event.X); index >= 0 {
+			m.focus = focusAgent
+			return m.requestAgentSwitch(m.agents[index])
+		}
 	}
 	deleteStart := max(0, m.width-deleteFooterWidth)
 	if event.Action == tea.MouseActionPress && event.Button == tea.MouseButtonLeft && event.Y == m.height-1 && event.X >= deleteStart && event.X < m.width {
@@ -819,6 +1004,18 @@ func (m uiModel) stateIndexAtX(x int) int {
 	return -1
 }
 
+func (m uiModel) agentIndexAtX(x int) int {
+	cursor := lipgloss.Width("skillctl  AGENT ")
+	for index, candidate := range m.agents {
+		width := lipgloss.Width(" " + agentLabel(candidate) + " ")
+		if x >= cursor && x < cursor+width {
+			return index
+		}
+		cursor += width + 1
+	}
+	return -1
+}
+
 func (m *uiModel) applyLoaded(items []service.SkillStatus, discovery model.DiscoveryReport) {
 	previous := map[string]service.SkillStatus{}
 	for _, item := range m.items {
@@ -845,9 +1042,7 @@ func (m *uiModel) applyLoaded(items []service.SkillStatus, discovery model.Disco
 	preferredSkill := m.selectAfterLoad
 	m.selectAfterLoad = ""
 	m.rebuild(preferredSkill)
-	if !discovery.Complete() {
-		m.status = fmt.Sprintf("Loaded %d non-plugin skills; plugin status unavailable", len(items))
-	} else if len(discovery.Warnings) > 0 {
+	if len(discovery.Warnings) > 0 {
 		m.status = fmt.Sprintf("Loaded %d skills with %d warnings", len(items), len(discovery.Warnings))
 	} else {
 		m.status = fmt.Sprintf("Loaded %d skills", len(items))
@@ -870,7 +1065,7 @@ func (m *uiModel) rebuild(preferredSkill string) {
 	}
 	filtered := inventory.Apply(m.items, filter)
 	m.groups = inventory.GroupStatuses(filtered)
-	m.states = inventory.StateOptions(m.items, filter)
+	m.states = inventory.StateOptions(m.items, filter, m.manager.ValidStates())
 	m.stateIndex = stateOptionIndex(m.states, selectedState)
 	if m.stateIndex < 0 {
 		m.stateIndex = 0
@@ -995,6 +1190,10 @@ func (m uiModel) currentSkill() (service.SkillStatus, bool) {
 }
 
 func (m uiModel) stageCurrent(desired model.InvocationState) uiModel {
+	if !model.ValidState(m.manager.Agent, desired) {
+		m.status = fmt.Sprintf("%s does not support %s", m.manager.Agent, desired)
+		return m
+	}
 	skill, ok := m.currentSkill()
 	if !ok {
 		m.status = "Select a skill first"
@@ -1002,6 +1201,9 @@ func (m uiModel) stageCurrent(desired model.InvocationState) uiModel {
 	}
 	if !skill.Managed {
 		m.status = skill.Name + " is outside the active management scope"
+		if skill.BlockedBy != "" {
+			m.status += ": " + skill.BlockedBy
+		}
 		return m
 	}
 	delete(m.applied, skill.ID)
@@ -1127,15 +1329,15 @@ func (m uiModel) applyCmd() tea.Cmd {
 func (m uiModel) deleteCmd() tea.Cmd {
 	skill := m.deleteSkill
 	return func() tea.Msg {
-		err := m.manager.DeleteSkill(skill.Skill)
+		err := m.manager.DeleteSkill(skill.Skill, m.project)
 		return deletedMsg{skill: skill, err: err}
 	}
 }
 
 func (m uiModel) fingerprintCmd() tea.Cmd {
 	return tea.Tick(2*time.Second, func(time.Time) tea.Msg {
-		value, err := m.watch.Fingerprint()
-		return fingerprintMsg{value: value, err: err}
+		value, err := m.watch.Fingerprint(m.manager.Agent)
+		return fingerprintMsg{value: value, err: err, agent: m.manager.Agent}
 	})
 }
 

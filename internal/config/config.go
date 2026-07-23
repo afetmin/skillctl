@@ -1,11 +1,13 @@
 package config
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 
@@ -13,7 +15,7 @@ import (
 	"skillctl/internal/model"
 )
 
-const CurrentVersion = 1
+const CurrentVersion = 2
 
 type Error struct {
 	Err error
@@ -23,11 +25,8 @@ func (e *Error) Error() string { return e.Err.Error() }
 func (e *Error) Unwrap() error { return e.Err }
 
 type Config struct {
-	Version       int                `yaml:"version" json:"version"`
-	ActiveProfile string             `yaml:"active_profile" json:"active_profile"`
-	Defaults      Defaults           `yaml:"defaults" json:"defaults"`
-	Profiles      map[string]Profile `yaml:"profiles" json:"profiles"`
-	Adapters      Adapters           `yaml:"adapters" json:"adapters"`
+	Version int    `yaml:"version" json:"version"`
+	Agents  Agents `yaml:"agents" json:"agents"`
 }
 
 type Defaults struct {
@@ -36,26 +35,40 @@ type Defaults struct {
 
 type Profile struct {
 	Implicit []string `yaml:"implicit" json:"implicit"`
+	NameOnly []string `yaml:"name_only,omitempty" json:"name_only,omitempty"`
+	Manual   []string `yaml:"manual,omitempty" json:"manual,omitempty"`
 	Disabled []string `yaml:"disabled,omitempty" json:"disabled,omitempty"`
 }
 
-type Adapters struct {
-	Codex CodexAdapter `yaml:"codex" json:"codex"`
+type Agents struct {
+	Codex  AgentConfig `yaml:"codex" json:"codex"`
+	Claude AgentConfig `yaml:"claude" json:"claude"`
 }
 
-type CodexAdapter struct {
-	Command string `yaml:"command" json:"command"`
+type AgentConfig struct {
+	Command       string             `yaml:"command" json:"command"`
+	ActiveProfile string             `yaml:"active_profile" json:"active_profile"`
+	Defaults      Defaults           `yaml:"defaults" json:"defaults"`
+	Profiles      map[string]Profile `yaml:"profiles" json:"profiles"`
 }
 
 func Default() Config {
+	defaultAgent := func(command string) AgentConfig {
+		return AgentConfig{
+			Command:       command,
+			ActiveProfile: "default",
+			Defaults:      Defaults{Invocation: model.StateManual},
+			Profiles: map[string]Profile{
+				"default": {Implicit: []string{}, NameOnly: []string{}, Manual: []string{}, Disabled: []string{}},
+			},
+		}
+	}
 	return Config{
-		Version:       CurrentVersion,
-		ActiveProfile: "default",
-		Defaults:      Defaults{Invocation: model.StateManual},
-		Profiles: map[string]Profile{
-			"default": {Implicit: []string{}, Disabled: []string{}},
+		Version: CurrentVersion,
+		Agents: Agents{
+			Codex:  defaultAgent("codex"),
+			Claude: defaultAgent("claude"),
 		},
-		Adapters: Adapters{Codex: CodexAdapter{Command: "codex"}},
 	}
 }
 
@@ -76,8 +89,19 @@ func Load(path string) (Config, error) {
 	if err != nil {
 		return Config{}, &Error{Err: err}
 	}
+	var header struct {
+		Version int `yaml:"version"`
+	}
+	if err := yaml.Unmarshal(data, &header); err != nil {
+		return Config{}, &Error{Err: fmt.Errorf("parse config: %w", err)}
+	}
+	if header.Version != CurrentVersion {
+		return Config{}, &Error{Err: fmt.Errorf("unsupported config version %d; back up the file and manually convert it to version %d", header.Version, CurrentVersion)}
+	}
 	var cfg Config
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
+	decoder := yaml.NewDecoder(bytes.NewReader(data))
+	decoder.KnownFields(true)
+	if err := decoder.Decode(&cfg); err != nil {
 		return Config{}, &Error{Err: fmt.Errorf("parse config: %w", err)}
 	}
 	if err := cfg.Validate(); err != nil {
@@ -110,56 +134,127 @@ func Save(path string, cfg Config) error {
 
 func (c Config) Validate() error {
 	if c.Version != CurrentVersion {
-		return fmt.Errorf("unsupported config version %d", c.Version)
+		return fmt.Errorf("unsupported config version %d; back up the file and manually convert it to version %d", c.Version, CurrentVersion)
 	}
-	if c.ActiveProfile == "" {
+	if err := validateAgent(model.AgentCodex, c.Agents.Codex); err != nil {
+		return err
+	}
+	return validateAgent(model.AgentClaude, c.Agents.Claude)
+}
+
+func validateAgent(agent model.Agent, value AgentConfig) error {
+	if value.Command == "" {
+		return fmt.Errorf("%s command is required", agent)
+	}
+	if value.ActiveProfile == "" {
 		return errors.New("active_profile is required")
 	}
-	if !c.Defaults.Invocation.Valid() {
-		return fmt.Errorf("invalid default invocation state %q", c.Defaults.Invocation)
+	if !model.ValidState(agent, value.Defaults.Invocation) {
+		return fmt.Errorf("invalid %s default invocation state %q", agent, value.Defaults.Invocation)
 	}
-	if c.Defaults.Invocation != model.StateManual {
-		return errors.New("v1 requires defaults.invocation to be manual")
+	if _, ok := value.Profiles[value.ActiveProfile]; !ok {
+		return fmt.Errorf("%s active profile %q does not exist", agent, value.ActiveProfile)
 	}
-	if _, ok := c.Profiles[c.ActiveProfile]; !ok {
-		return fmt.Errorf("active profile %q does not exist", c.ActiveProfile)
-	}
-	for name, profile := range c.Profiles {
-		disabled := map[string]bool{}
-		for _, selector := range profile.Disabled {
-			disabled[selector] = true
+	for name, profile := range value.Profiles {
+		if agent == model.AgentCodex && len(profile.NameOnly) > 0 {
+			return fmt.Errorf("codex profile %q contains name_only selectors, but Codex does not support name-only", name)
 		}
-		for _, selector := range profile.Implicit {
-			if disabled[selector] {
-				return fmt.Errorf("profile %q contains %q in both implicit and disabled", name, selector)
+		seen := map[string]model.InvocationState{}
+		groups := []struct {
+			state     model.InvocationState
+			selectors []string
+		}{
+			{state: model.StateImplicit, selectors: profile.Implicit},
+			{state: model.StateNameOnly, selectors: profile.NameOnly},
+			{state: model.StateManual, selectors: profile.Manual},
+			{state: model.StateDisabled, selectors: profile.Disabled},
+		}
+		for _, group := range groups {
+			for _, selector := range group.selectors {
+				if !supportedSelector(agent, selector) {
+					return fmt.Errorf("%s profile %q contains unsupported selector %q", agent, name, selector)
+				}
+				if previous, ok := seen[selector]; ok {
+					return fmt.Errorf("%s profile %q contains %q in both %s and %s", agent, name, selector, previous, group.state)
+				}
+				seen[selector] = group.state
 			}
 		}
 	}
 	return nil
 }
 
-func (c Config) Active() Profile {
-	return c.Profiles[c.ActiveProfile]
+func supportedSelector(agent model.Agent, selector string) bool {
+	switch {
+	case strings.HasPrefix(selector, "codex:"):
+		return agent == model.AgentCodex &&
+			(strings.HasPrefix(selector, "codex:user:agents:") ||
+				strings.HasPrefix(selector, "codex:user:codex:") ||
+				strings.HasPrefix(selector, "codex:repo:"))
+	case strings.HasPrefix(selector, "claude:"):
+		return agent == model.AgentClaude &&
+			(strings.HasPrefix(selector, "claude:user:claude:") ||
+				strings.HasPrefix(selector, "claude:repo:"))
+	default:
+		return true
+	}
 }
 
-func (c *Config) SetState(id, name string, desired model.InvocationState, aliases ...string) {
-	profile := c.Profiles[c.ActiveProfile]
+func (c Config) Agent(agent model.Agent) (AgentConfig, error) {
+	switch agent {
+	case model.AgentCodex:
+		return c.Agents.Codex, nil
+	case model.AgentClaude:
+		return c.Agents.Claude, nil
+	default:
+		return AgentConfig{}, fmt.Errorf("unsupported agent %q", agent)
+	}
+}
+
+func (c Config) Active(agent model.Agent) Profile {
+	value, _ := c.Agent(agent)
+	return value.Profiles[value.ActiveProfile]
+}
+
+func (c *Config) SetState(agent model.Agent, id, name string, desired model.InvocationState, aliases ...string) error {
+	if !model.ValidState(agent, desired) {
+		return fmt.Errorf("%s does not support invocation state %q", agent, desired)
+	}
+	value, err := c.Agent(agent)
+	if err != nil {
+		return err
+	}
+	profile := value.Profiles[value.ActiveProfile]
 	for _, selector := range append([]string{id, name}, aliases...) {
 		if selector == "" {
 			continue
 		}
 		profile.Implicit = remove(profile.Implicit, selector)
+		profile.NameOnly = remove(profile.NameOnly, selector)
+		profile.Manual = remove(profile.Manual, selector)
 		profile.Disabled = remove(profile.Disabled, selector)
 	}
 	switch desired {
 	case model.StateImplicit:
 		profile.Implicit = append(profile.Implicit, id)
+	case model.StateNameOnly:
+		profile.NameOnly = append(profile.NameOnly, id)
+	case model.StateManual:
+		profile.Manual = append(profile.Manual, id)
 	case model.StateDisabled:
 		profile.Disabled = append(profile.Disabled, id)
 	}
 	sort.Strings(profile.Implicit)
+	sort.Strings(profile.NameOnly)
+	sort.Strings(profile.Manual)
 	sort.Strings(profile.Disabled)
-	c.Profiles[c.ActiveProfile] = profile
+	value.Profiles[value.ActiveProfile] = profile
+	if agent == model.AgentCodex {
+		c.Agents.Codex = value
+	} else {
+		c.Agents.Claude = value
+	}
+	return nil
 }
 
 func remove(values []string, target string) []string {
